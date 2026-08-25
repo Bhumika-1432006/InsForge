@@ -149,7 +149,7 @@ paths:
 
   /api/logs/stats:
     get:
-      summary: Per-source log statistics
+      summary: Get per-source log statistics
       description: |
         One entry per system log source. This is not the audit-log summary;
         that lives at `/api/logs/audits/stats`.
@@ -196,7 +196,7 @@ paths:
 
   /api/logs/audits/stats:
     get:
-      summary: Audit log summary
+      summary: Get audit log summary
       description: |
         Aggregates the audit log over the last `days` days. `totalLogs`,
         `uniqueActors` and `uniqueModules` are counts across that window,
@@ -375,7 +375,7 @@ paths:
 
   /api/logs/functions/build-logs:
     get:
-      summary: Function build logs
+      summary: Get function build logs
       tags:
         - Admin
       security:
@@ -437,7 +437,7 @@ paths:
 
   /api/logs/{source}:
     get:
-      summary: Logs from one source
+      summary: Get logs from one source
       tags:
         - Admin
       security:

@@ -280,7 +280,7 @@ paths:
                 error: "UNAUTHORIZED"
                 message: "Invalid or missing authentication"
                 statusCode: 401
-                nextAction: "Please provide valid authentication credentials"
+                nextActions: "Please provide valid authentication credentials"
 
   /api/metadata/api-key:
     get:
@@ -312,7 +312,7 @@ paths:
                 error: "INSUFFICIENT_PERMISSIONS"
                 message: "Only admin users can access API keys"
                 statusCode: 403
-                nextAction: "Contact an administrator for API key access"
+                nextActions: "Contact an administrator for API key access"
 
   /api/metadata/anon-key:
     get:
@@ -379,6 +379,6 @@ components:
         statusCode:
           type: integer
           description: HTTP status code
-        nextAction:
+        nextActions:
           type: string
           description: Suggested action to resolve the error

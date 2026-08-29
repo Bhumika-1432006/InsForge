@@ -88,11 +88,11 @@ graph TB
     linkStyle default stroke:#30363d,stroke-width:1px
 ```
 
-### Core Products:
+### Core Products
 - **Authentication**: User management, authentication, and sessions
 - **Database**: Postgres relational database
-- **Storage**: S3 compatible file storage
-- **Model Gateway**: OpenAI compatible API across multiple LLM providers
+- **Storage**: S3-compatible file storage
+- **Model Gateway**: OpenAI-compatible API across multiple LLM providers
 - **Edge Functions**: Serverless code running on the edge
 - **Compute** (private preview): Long-running container services
 - **Site Deployment**: Site build and deployment
@@ -169,7 +169,7 @@ further `-f` flags rather than editing that variable.
 
 Open [http://localhost:7130](http://localhost:7130)
 
-Follow the steps to connect InsForge MCP Server
+Follow the steps to connect InsForge MCP Server.
 
 <div align="center">
 <img src="assets/connect.png" alt="Connect InsForge MCP" width="600">
@@ -263,7 +263,7 @@ In addition to running InsForge locally, you can also launch InsForge using a pr
 
 ## Contributing
 
-**Contributing**: If you're interested in contributing, you can check our guide here [CONTRIBUTING.md](CONTRIBUTING.md). We truly appreciate pull requests, all types of help are appreciated!
+**Contributing**: If you're interested in contributing, you can check our guide here [CONTRIBUTING.md](CONTRIBUTING.md). We truly appreciate pull requests, and all types of help are appreciated!
 
 **Support**: If you need any help or support, we're responsive on our [Discord channel](https://discord.com/invite/MPxwj5xVvW), and also feel free to email us [info@insforge.dev](mailto:info@insforge.dev) too!
 

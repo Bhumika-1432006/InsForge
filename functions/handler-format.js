@@ -24,19 +24,86 @@
  *   - concatenated ahead of `worker-template.js` by `server.ts` before the
  *     combined source is handed to `new Function`/`Worker`, and
  *   - loaded directly in unit tests via `vm` without any Deno globals.
+ * It stays plain JS (matching worker-template.js's own existing precedent,
+ * for the same reason — both are read as-is at runtime with no build step)
+ * rather than TypeScript compiled ahead of time.
  *
  * Scope: this targets the one documented handler shape (a top-level
  * `export default` function/arrow expression, optionally typed, optionally
  * importing the injected SDK/base64 bindings) — not arbitrary TypeScript or
  * ESM. Anything outside that shape is left untouched, which reproduces
  * today's plain syntax error rather than silently miscompiling it.
+ *
+ * Regex-based detection alone would misfire on text that merely *looks*
+ * like code inside a string, template literal, or comment (e.g. a handler
+ * whose body contains the literal text "module.exports =" in a log
+ * message). `maskNonCode` blanks out that content — preserving length and
+ * newlines — so every pattern below is matched against the masked source to
+ * find real positions, while every rewrite still slices/reads the original,
+ * unmasked `code` at those positions.
  */
 
-// Legacy CommonJS handlers are detected by an actual top-level assignment,
-// not a bare substring search — `module.exports` appearing only inside a
-// comment or string (e.g. a migration note like "// previously:
-// module.exports = ...") must not skip normalization for what is otherwise
-// a valid `export default` handler.
+/**
+ * Replaces the contents of string literals ('...', "...", `...`) and
+ * comments (// and /* *\/) with spaces, preserving length and newlines, so
+ * character offsets stay valid against the original source. Not a full
+ * tokenizer — doesn't need to be, since callers only use it to find *where*
+ * a pattern lexically starts, never to execute the masked text itself.
+ */
+function maskNonCode(code) {
+  let result = '';
+  let i = 0;
+  while (i < code.length) {
+    const char = code[i];
+    const twoChars = code.slice(i, i + 2);
+
+    if (twoChars === '//') {
+      let j = i;
+      while (j < code.length && code[j] !== '\n') {
+        j += 1;
+      }
+      result += code.slice(i, j).replace(/[^\n]/g, ' ');
+      i = j;
+      continue;
+    }
+
+    if (twoChars === '/*') {
+      let j = i + 2;
+      while (j < code.length - 1 && code.slice(j, j + 2) !== '*/') {
+        j += 1;
+      }
+      j = Math.min(j + 2, code.length);
+      result += code.slice(i, j).replace(/[^\n]/g, ' ');
+      i = j;
+      continue;
+    }
+
+    if (char === '"' || char === "'" || char === '`') {
+      // Preserve the quote characters themselves — only blank the content
+      // between them — so a pattern that checks for a real quote (e.g. the
+      // `from '...'` clause of an import) still matches the masked text.
+      const quote = char;
+      let j = i + 1;
+      while (j < code.length && code[j] !== quote) {
+        j += code[j] === '\\' ? 2 : 1;
+      }
+      const closed = j < code.length;
+      const innerEnd = Math.min(j, code.length);
+      const inner = code.slice(i + 1, innerEnd).replace(/[^\n]/g, ' ');
+      result += quote + inner + (closed ? quote : '');
+      i = closed ? j + 1 : innerEnd;
+      continue;
+    }
+
+    result += char;
+    i += 1;
+  }
+  return result;
+}
+
+// Legacy CommonJS handlers are detected by an actual top-level assignment
+// (matched against the masked source — see file header), not a bare
+// substring search that a comment or template literal could trigger.
 const LEGACY_ASSIGNMENT_PATTERN = /^[ \t]*module\.exports\s*=/m;
 
 // Named bindings the worker wrapper injects as call arguments, keyed by the
@@ -57,7 +124,7 @@ const IMPORT_STATEMENT_PATTERN =
   /^[ \t]*import\s*\{([^}]*)\}\s*from\s*(['"])([^'"]*)\2\s*;?[ \t]*\r?\n?/gm;
 
 /**
- * Rewrites the known-injectable imports in `code` in place:
+ * Rewrites the known-injectable imports in `code`:
  *  - a specifier matching its injected name exactly (`createClient`) is
  *    simply dropped — the wrapper already provides that identifier.
  *  - an aliased specifier (`createClient as makeClient`) is replaced with
@@ -66,81 +133,173 @@ const IMPORT_STATEMENT_PATTERN =
  *    from any other source, is left completely untouched.
  */
 function resolveKnownImports(code) {
-  return code.replace(IMPORT_STATEMENT_PATTERN, (fullMatch, specifierList, _quote, source) => {
+  const masked = maskNonCode(code);
+  // 'd' adds match.indices, so the specifier list and source are read back
+  // from the original `code` at those positions — the masked text is only
+  // used to find real (non-string/comment) import statements; its capture
+  // groups are blanked and unusable as content (the whole point of masking
+  // the source string is that it's blanked).
+  const pattern = new RegExp(IMPORT_STATEMENT_PATTERN.source, IMPORT_STATEMENT_PATTERN.flags + 'd');
+
+  let result = '';
+  let lastIndex = 0;
+  let match;
+  while ((match = pattern.exec(masked))) {
+    const fullMatch = match[0];
+    const [specifierStart, specifierEnd] = match.indices[1];
+    const [sourceStart, sourceEnd] = match.indices[3];
+    const specifierList = code.slice(specifierStart, specifierEnd);
+    const source = code.slice(sourceStart, sourceEnd);
+    result += code.slice(lastIndex, match.index);
+
     const known = INJECTABLE_BINDINGS_BY_SOURCE.find((entry) =>
       entry.source ? entry.source === source : entry.sourcePattern.test(source)
     );
+
     if (!known) {
-      return fullMatch;
+      result += code.slice(match.index, match.index + fullMatch.length);
+    } else {
+      const specifiers = specifierList
+        .split(',')
+        .map((specifier) => specifier.trim())
+        .filter(Boolean);
+
+      const aliasDeclarations = [];
+      let unresolvable = false;
+      for (const specifier of specifiers) {
+        const aliasMatch = /^([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)$/.exec(specifier);
+        const importedName = aliasMatch ? aliasMatch[1] : specifier;
+        const localName = aliasMatch ? aliasMatch[2] : specifier;
+
+        if (!known.names.includes(importedName)) {
+          // Not something the wrapper injects — bail on the whole statement
+          // rather than guessing at a partial rewrite.
+          unresolvable = true;
+          break;
+        }
+        if (localName !== importedName) {
+          aliasDeclarations.push(`const ${localName} = ${importedName};`);
+        }
+      }
+
+      result += unresolvable
+        ? code.slice(match.index, match.index + fullMatch.length)
+        : aliasDeclarations.length > 0
+          ? aliasDeclarations.join('\n') + '\n'
+          : '';
     }
 
-    const specifiers = specifierList
-      .split(',')
-      .map((specifier) => specifier.trim())
-      .filter(Boolean);
-
-    const aliasDeclarations = [];
-    for (const specifier of specifiers) {
-      const aliasMatch = /^([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)$/.exec(specifier);
-      const importedName = aliasMatch ? aliasMatch[1] : specifier;
-      const localName = aliasMatch ? aliasMatch[2] : specifier;
-
-      if (!known.names.includes(importedName)) {
-        // Not something the wrapper injects (e.g. a type-only import, or a
-        // real export we don't provide locally) — bail on the whole
-        // statement rather than guessing at a partial rewrite.
-        return fullMatch;
-      }
-      if (localName !== importedName) {
-        aliasDeclarations.push(`const ${localName} = ${importedName};`);
-      }
-    }
-
-    return aliasDeclarations.length > 0 ? aliasDeclarations.join('\n') + '\n' : '';
-  });
+    lastIndex = match.index + fullMatch.length;
+  }
+  result += code.slice(lastIndex);
+  return result;
 }
 
 /**
- * Strips TypeScript type annotations from a handler's parameter list,
- * respecting bracket depth so a generic type's internal commas
- * (`opts: Record<string, string>`) aren't mistaken for parameter
- * separators, and default values (`opts: Options = {}`) are preserved.
+ * Strips TypeScript type annotations from a handler's parameter list.
+ *
+ * Tracks three states per parameter — `name` (before any `:`), `type`
+ * (consuming the annotation), `default` (after the `=` of a default value)
+ * — rather than a single depth-only pass, so that:
+ *  - a generic type's internal comma (`opts: Record<string, string>`) isn't
+ *    mistaken for a parameter separator (bracket depth),
+ *  - a function-type arrow inside a type (`cb: () => void`) isn't mistaken
+ *    for the start of a default value (only `=` NOT followed by `>` ends
+ *    type mode), and
+ *  - a `:` inside a default value's own expression (a ternary,
+ *    `opts: Options = cond ? a : b`) is never reinterpreted as the start of
+ *    another type annotation — once a parameter reaches `default` mode, a
+ *    `:` is just a character in that expression.
+ *
+ * Operates on `originalSource` for the text it keeps/drops, but makes every
+ * control-flow decision (bracket depth, which state a `:`/`=`/`,` triggers)
+ * against `maskedSource` (see `maskNonCode`) so a colon or brace inside a
+ * default value's own string literal can't desynchronize bracket depth or
+ * be mistaken for a type delimiter.
  */
-function stripParamTypeAnnotations(paramsSource) {
+function stripParamTypeAnnotations(originalSource, maskedSource) {
   let result = '';
   let depth = 0;
-  let inType = false;
+  let mode = 'name'; // 'name' | 'type' | 'default'
 
-  for (const char of paramsSource) {
+  for (let i = 0; i < maskedSource.length; i += 1) {
+    const char = maskedSource[i];
+    const keep = () => {
+      result += originalSource[i];
+    };
+
     if ('([{<'.includes(char)) {
       depth += 1;
-      if (!inType) {
-        result += char;
+      if (mode !== 'type') {
+        keep();
       }
       continue;
     }
     if (')]}>'.includes(char)) {
       depth = Math.max(0, depth - 1);
-      if (!inType) {
-        result += char;
+      if (mode !== 'type') {
+        keep();
       }
       continue;
     }
-    if (depth === 0 && !inType && char === ':') {
-      inType = true;
+    if (depth === 0 && mode === 'name' && char === ':') {
+      mode = 'type';
       continue;
     }
-    if (depth === 0 && inType && (char === ',' || char === '=')) {
-      inType = false;
-      result += char;
+    if (depth === 0 && mode === 'type' && char === '=' && maskedSource[i + 1] === '>') {
+      // Function-type arrow (`() => void`) — part of the type, not a
+      // default-value marker. Stays in type mode; both chars are dropped.
+      i += 1;
       continue;
     }
-    if (!inType) {
-      result += char;
+    if (depth === 0 && mode === 'type' && char === '=') {
+      mode = 'default';
+      keep();
+      continue;
+    }
+    if (depth === 0 && (mode === 'type' || mode === 'default') && char === ',') {
+      mode = 'name';
+      keep();
+      continue;
+    }
+    if (mode !== 'type') {
+      keep();
     }
   }
 
   return result;
+}
+
+/**
+ * Strips a handler's return-type annotation — the `: T` between the
+ * parameter list's `)` and the function body's `{` or an arrow's `=>` — by
+ * scanning bracket depth (against the masked source, for the same reason as
+ * `stripParamTypeAnnotations`) rather than stopping at the first `{`, so a
+ * return type containing its own object-literal type
+ * (`Promise<{ status: number }>`) isn't truncated mid-type.
+ */
+function stripReturnType(originalAfterParams, maskedAfterParams) {
+  const colonMatch = /^[ \t]*:/.exec(maskedAfterParams);
+  if (!colonMatch) {
+    return originalAfterParams;
+  }
+
+  let i = colonMatch[0].length;
+  let depth = 0;
+  while (i < maskedAfterParams.length) {
+    const char = maskedAfterParams[i];
+    if (depth === 0 && (char === '{' || (char === '=' && maskedAfterParams[i + 1] === '>'))) {
+      break;
+    }
+    if ('([{<'.includes(char)) {
+      depth += 1;
+    } else if (')]}>'.includes(char)) {
+      depth = Math.max(0, depth - 1);
+    }
+    i += 1;
+  }
+
+  return originalAfterParams.slice(0, colonMatch[0].length - 1) + originalAfterParams.slice(i);
 }
 
 /**
@@ -157,8 +316,11 @@ function stripParamTypeAnnotations(paramsSource) {
  */
 function stripHandlerSignatureTypes(code, fromIndex) {
   const rest = code.slice(fromIndex);
+  const maskedRest = maskNonCode(rest);
 
-  const headerMatch = /^(\s*)(async\s+)?(function\s*[A-Za-z_$][\w$]*\s*|function\s*)?\(/.exec(rest);
+  const headerMatch = /^(\s*)(async\s+)?(function\s*[A-Za-z_$][\w$]*\s*|function\s*)?\(/.exec(
+    maskedRest
+  );
   if (!headerMatch) {
     return code;
   }
@@ -166,8 +328,8 @@ function stripHandlerSignatureTypes(code, fromIndex) {
   const parenStart = headerMatch[0].length - 1;
   let depth = 0;
   let parenEnd = -1;
-  for (let i = parenStart; i < rest.length; i += 1) {
-    const char = rest[i];
+  for (let i = parenStart; i < maskedRest.length; i += 1) {
+    const char = maskedRest[i];
     if ('([{'.includes(char)) {
       depth += 1;
     } else if (')]}'.includes(char)) {
@@ -182,14 +344,12 @@ function stripHandlerSignatureTypes(code, fromIndex) {
     return code;
   }
 
-  const paramsInner = rest.slice(parenStart + 1, parenEnd);
-  const strippedParams = stripParamTypeAnnotations(paramsInner);
+  const strippedParams = stripParamTypeAnnotations(
+    rest.slice(parenStart + 1, parenEnd),
+    maskedRest.slice(parenStart + 1, parenEnd)
+  );
 
-  let afterParams = rest.slice(parenEnd + 1);
-  // A return-type annotation runs from ':' up to (not including) the body's
-  // opening '{' or an arrow's '=>'. Only stripped when one of those actually
-  // follows, so an unrelated ':' doesn't eat the rest of the file.
-  afterParams = afterParams.replace(/^([ \t]*):[^{]*?(?=\{|=>)/, '$1');
+  const afterParams = stripReturnType(rest.slice(parenEnd + 1), maskedRest.slice(parenEnd + 1));
 
   return (
     code.slice(0, fromIndex) + rest.slice(0, parenStart + 1) + strippedParams + ')' + afterParams
@@ -197,13 +357,13 @@ function stripHandlerSignatureTypes(code, fromIndex) {
 }
 
 function normalizeHandlerFormat(code) {
-  if (LEGACY_ASSIGNMENT_PATTERN.test(code)) {
+  if (LEGACY_ASSIGNMENT_PATTERN.test(maskNonCode(code))) {
     return code;
   }
 
   let normalized = resolveKnownImports(code);
 
-  const exportDefaultMatch = /(^|\n)([ \t]*)export\s+default\s+/.exec(normalized);
+  const exportDefaultMatch = /(^|\n)([ \t]*)export\s+default\s+/.exec(maskNonCode(normalized));
   if (!exportDefaultMatch) {
     return normalized;
   }

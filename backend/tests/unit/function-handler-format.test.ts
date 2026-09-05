@@ -204,4 +204,92 @@ export default async function (req: Request): Promise<Response> {
     const result = normalizeHandlerFormat(code);
     expect(result).toBe('module.exports = someModule.handler;');
   });
+
+  // Round-2 regression coverage: a second review pass on the fixes above
+  // found further edge cases in the type-annotation stripping and the
+  // string/comment-unaware regex matching. Each of these previously either
+  // produced invalid JavaScript or was incorrectly rewritten/skipped.
+
+  it('does not corrupt a ternary expression used as a parameter default value', async () => {
+    const code = `export default async function (req: Request, opts: string = true ? "a" : "b"): Promise<Response> {
+  return new Response(opts);
+}`;
+
+    const result = normalizeHandlerFormat(code);
+    const wrapper = new Function('exports', 'module', result);
+    const exportsObj: Record<string, unknown> = {};
+    const moduleObj = { exports: exportsObj };
+    wrapper(exportsObj, moduleObj);
+    const handler = moduleObj.exports as (req: unknown) => Promise<{ text(): Promise<string> }>;
+    const response = await handler({});
+    expect(await response.text()).toBe('a');
+  });
+
+  it("does not treat a function-type parameter's arrow as a default-value marker", () => {
+    const code = `export default async function (req: Request, cb: () => void): Promise<Response> {
+  cb();
+  return new Response("hi");
+}`;
+
+    const result = normalizeHandlerFormat(code);
+    const wrapper = new Function('exports', 'module', result);
+    const exportsObj: Record<string, unknown> = {};
+    const moduleObj = { exports: exportsObj };
+    wrapper(exportsObj, moduleObj);
+    const handler = moduleObj.exports as (req: unknown, cb: () => void) => unknown;
+    let called = false;
+    handler({}, () => {
+      called = true;
+    });
+    expect(called).toBe(true);
+  });
+
+  it('strips a return type that itself contains an object-literal type', () => {
+    const code = `export default async function (req: Request): Promise<{ status: number }> {
+  return { status: 200 };
+}`;
+
+    const result = normalizeHandlerFormat(code);
+    expect(result).not.toMatch(/Promise</);
+    const wrapper = new Function('exports', 'module', result);
+    const exportsObj: Record<string, unknown> = {};
+    const moduleObj = { exports: exportsObj };
+    wrapper(exportsObj, moduleObj);
+    const handler = moduleObj.exports as (req: unknown) => Promise<{ status: number }>;
+    expect(typeof handler).toBe('function');
+  });
+
+  it('does not rewrite import-shaped text inside a template literal', async () => {
+    const code = `export default async function (req: Request): Promise<Response> {
+  const msg = \`import { createClient } from 'npm:@insforge/sdk';\`;
+  return new Response(msg);
+}`;
+
+    const result = normalizeHandlerFormat(code);
+    expect(result).toContain("const msg = `import { createClient } from 'npm:@insforge/sdk';`;");
+    const wrapper = new Function('exports', 'module', result);
+    const exportsObj: Record<string, unknown> = {};
+    const moduleObj = { exports: exportsObj };
+    wrapper(exportsObj, moduleObj);
+    const handler = moduleObj.exports as (req: unknown) => Promise<{ text(): Promise<string> }>;
+    const response = await handler({});
+    expect(await response.text()).toBe("import { createClient } from 'npm:@insforge/sdk';");
+  });
+
+  it('does not skip normalization when "module.exports =" only appears in a string literal', async () => {
+    const code = `export default async function (req: Request): Promise<Response> {
+  const msg = 'module.exports = fake';
+  return new Response(msg);
+}`;
+
+    const result = normalizeHandlerFormat(code);
+    expect(result).toMatch(/^module\.exports = async function/);
+    const wrapper = new Function('exports', 'module', result);
+    const exportsObj: Record<string, unknown> = {};
+    const moduleObj = { exports: exportsObj };
+    wrapper(exportsObj, moduleObj);
+    const handler = moduleObj.exports as (req: unknown) => Promise<{ text(): Promise<string> }>;
+    const response = await handler({});
+    expect(await response.text()).toBe('module.exports = fake');
+  });
 });

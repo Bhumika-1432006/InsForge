@@ -269,10 +269,29 @@ router.post(
         res.setHeader('Connection', 'keep-alive');
 
         // Create and process the stream
+        let aborted = false;
+        let streamGenerator: ReturnType<typeof chatService.streamChat> | undefined;
+        const onClientClose = () => {
+          aborted = true;
+          // Actively cancel rather than waiting for the loop below to notice:
+          // `for await` only re-checks `aborted` once the generator's current
+          // `.next()` settles, which for a generator suspended mid-await (the
+          // common case — it's waiting on the next chunk from the upstream
+          // provider) could be seconds away. Calling `.return()` here queues
+          // the cancellation to take effect the moment that settles, instead
+          // of after it produces a further chunk nobody will read. `for await`
+          // would call this same `.return()` on `break`, but only afterwards.
+          void streamGenerator?.return(undefined);
+        };
+        res.on('close', onClientClose);
+
         try {
-          const streamGenerator = chatService.streamChat(messages, options);
+          streamGenerator = chatService.streamChat(messages, options);
 
           for await (const data of streamGenerator) {
+            if (aborted) {
+              break;
+            }
             if (data.chunk) {
               res.write(`data: ${JSON.stringify({ chunk: data.chunk })}\n\n`);
             }
@@ -287,20 +306,28 @@ router.post(
             }
           }
 
-          // Send completion signal
-          res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+          if (!aborted) {
+            // Send completion signal
+            res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+          }
         } catch (streamError) {
           // If error occurs during streaming, send it in SSE format
           logger.error('Stream error during chat completion', {
             error: streamError instanceof Error ? streamError.message : String(streamError),
             stack: streamError instanceof Error ? streamError.stack : undefined,
           });
-          res.write(
-            `data: ${JSON.stringify({ error: true, message: streamError instanceof Error ? streamError.message : String(streamError) })}\n\n`
-          );
+          if (!aborted) {
+            res.write(
+              `data: ${JSON.stringify({ error: true, message: streamError instanceof Error ? streamError.message : String(streamError) })}\n\n`
+            );
+          }
+        } finally {
+          res.off('close', onClientClose);
         }
 
-        res.end();
+        if (!aborted) {
+          res.end();
+        }
         return;
       }
 

@@ -1,5 +1,5 @@
 import express, { Request, Response, NextFunction } from 'express';
-import cors from 'cors';
+import helmet from 'helmet';
 import cookieParser from 'cookie-parser';
 import dotenv from 'dotenv';
 import path from 'path';
@@ -25,6 +25,7 @@ import { s3GatewayRouter } from '@/api/routes/s3-gateway/index.routes.js';
 import { paymentsRouter } from '@/api/routes/payments/index.routes.js';
 import { advisorRouter } from '@/api/routes/advisor/index.routes.js';
 import { errorMiddleware } from '@/api/middlewares/error.js';
+import { corsMiddleware } from '@/api/middlewares/cors.js';
 import { destroyEmailCooldownInterval } from '@/api/middlewares/rate-limiters.js';
 import { isCloudEnvironment } from '@/utils/environment.js';
 import { RealtimeManager } from '@/infra/realtime/realtime.manager.js';
@@ -92,12 +93,19 @@ export async function createApp() {
 
   // Basic middleware
   app.use(
-    cors({
-      origin: true, // Allow all origins (matches Better Auth's trustedOrigins: ['*'])
-      credentials: true, // Allow cookies/credentials
-      exposedHeaders: ['Content-Range', 'Preference-Applied'],
+    helmet({
+      // The dashboard SPA and client apps embed third-party scripts/styles/images
+      // this project doesn't control, so a strict default CSP would break them;
+      // this hardening is scoped to the explicit header list below instead.
+      contentSecurityPolicy: false,
+      // Storage objects and API responses are deliberately fetched cross-origin
+      // by client apps (that's the point of a hosted backend), so the
+      // same-origin default here would break exactly the traffic this API serves.
+      crossOriginResourcePolicy: false,
+      crossOriginEmbedderPolicy: false,
     })
   );
+  app.use(corsMiddleware);
   app.use(cookieParser()); // Parse cookies for refresh token handling
   app.use((req: Request, res: Response, next: NextFunction) => {
     const startTime = Date.now();

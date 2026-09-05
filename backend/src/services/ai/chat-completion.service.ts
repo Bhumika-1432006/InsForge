@@ -386,10 +386,9 @@ export class ChatCompletionService {
 
       // Send request with upstream error mapping
       const { result: stream } = await this.openRouterProvider.sendRequest((client) =>
-        client.chat.completions.create(
-          request as OpenAI.Chat.ChatCompletionCreateParamsStreaming,
-          { signal }
-        )
+        client.chat.completions.create(request as OpenAI.Chat.ChatCompletionCreateParamsStreaming, {
+          signal,
+        })
       );
 
       const tokenUsage = {

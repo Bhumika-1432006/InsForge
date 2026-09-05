@@ -96,11 +96,8 @@ async function* fakeUpstreamStream(signal?: AbortSignal) {
 vi.mock('../../src/services/ai/chat-completion.service.js', () => ({
   ChatCompletionService: {
     getInstance: () => ({
-      streamChat: (
-        _messages: unknown,
-        _options: unknown,
-        signal?: AbortSignal
-      ) => fakeUpstreamStream(signal),
+      streamChat: (_messages: unknown, _options: unknown, signal?: AbortSignal) =>
+        fakeUpstreamStream(signal),
     }),
   },
 }));

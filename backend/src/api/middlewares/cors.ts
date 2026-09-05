@@ -49,6 +49,12 @@ async function getAllowedRedirectUrls(): Promise<string[]> {
         // so the error propagates and the caller fails closed instead.
         if (cache) {
           logger.error('Failed to refresh CORS allowlist; keeping previous list', { error });
+          // Re-arm the TTL against this failed attempt too, not just a
+          // successful one — otherwise a DB outage past the TTL means every
+          // subsequent request re-enters this branch and issues (and fails)
+          // another DB read, instead of serving the stale list for a full
+          // window before trying again.
+          cache.fetchedAt = Date.now();
           return cache.allowedRedirectUrls;
         }
         throw error;
@@ -60,17 +66,39 @@ async function getAllowedRedirectUrls(): Promise<string[]> {
   return refreshPromise;
 }
 
+// Ports the URL parser (and therefore Origin headers, which always come from
+// a real URL) already omits for these schemes — a pattern that spells one
+// out explicitly (`https://app.example.com:443`) must still match the origin
+// the browser actually sends (`https://app.example.com`).
+const DEFAULT_PORT_BY_SCHEME: Record<string, string> = { 'http:': '80', 'https:': '443' };
+
+function stripDefaultPort(scheme: string, host: string): string {
+  const defaultPort = DEFAULT_PORT_BY_SCHEME[`${scheme}:`];
+  return defaultPort && host.endsWith(`:${defaultPort}`)
+    ? host.slice(0, -(defaultPort.length + 1))
+    : host;
+}
+
 /**
  * Extracts `scheme://host[:port]` from a redirect-URL pattern, discarding any
- * path/query — an `Origin` header never carries either. `host` may contain a
- * single leading `*.` wildcard (subdomain match), the same shape
- * `AuthConfigService.validateRedirectUrl` documents for its glob patterns;
- * broader glob forms (`**`, `?`, `[...]`) don't have a meaningful analogue for
- * an origin and are intentionally not supported here.
+ * path/query — an `Origin` header never carries either. `host` may contain
+ * `*` wildcards anywhere (matching `AuthConfigService`'s own glob patterns,
+ * e.g. `*.example.com` or `*foo.example.com`); broader glob forms (`**`,
+ * `?`, `[...]`) don't have a meaningful analogue for a path-less origin and
+ * are intentionally not supported here.
  */
 function originFromPattern(pattern: string): { scheme: string; host: string } | null {
   const match = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/([^/?#]+)/.exec(pattern);
-  return match ? { scheme: match[1].toLowerCase(), host: match[2].toLowerCase() } : null;
+  if (!match) {
+    return null;
+  }
+  const scheme = match[1].toLowerCase();
+  return { scheme, host: stripDefaultPort(scheme, match[2].toLowerCase()) };
+}
+
+function hostPatternToRegExp(hostPattern: string): RegExp {
+  const escaped = hostPattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+  return new RegExp(`^${escaped}$`);
 }
 
 export function originMatchesPattern(pattern: string, origin: string): boolean {
@@ -89,19 +117,11 @@ export function originMatchesPattern(pattern: string, origin: string): boolean {
     return false;
   }
 
-  const originHost = originUrl.host.toLowerCase(); // includes port
+  const originHost = originUrl.host.toLowerCase(); // URL already omits a default port
   if (!parsedPattern.host.includes('*')) {
     return parsedPattern.host === originHost;
   }
-  if (parsedPattern.host.startsWith('*.')) {
-    // Matches only actual subdomains, not the bare apex — consistent with
-    // how the same `*.host` shape behaves under `matchesGlobPattern`
-    // (picomatch requires the literal "." before the base host to be
-    // present, so "*.example.com" does not match "example.com" itself).
-    const baseHost = parsedPattern.host.slice(2);
-    return originHost.endsWith(`.${baseHost}`);
-  }
-  return false;
+  return hostPatternToRegExp(parsedPattern.host).test(originHost);
 }
 
 const corsOriginCallback: NonNullable<CorsOptions['origin']> = (origin, callback) => {

@@ -103,6 +103,12 @@ export async function createApp() {
       // same-origin default here would break exactly the traffic this API serves.
       crossOriginResourcePolicy: false,
       crossOriginEmbedderPolicy: false,
+      // Helmet's default ('same-origin') severs `window.opener` for a popup
+      // opened from a different origin, breaking the cloud-hosting dashboard's
+      // opener-messaging bridge (frontend/src/cloud-hosting/useCloudHosting.ts,
+      // packages/dashboard/src/layout/AppLayout.tsx). This keeps the isolation
+      // benefit for same-origin popups while still allowing that bridge.
+      crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' },
     })
   );
   app.use(corsMiddleware);
@@ -312,11 +318,13 @@ export async function createApp() {
         responseHeaders[key] = value;
       }
 
-      res
-        .status(response.status)
-        .set(responseHeaders)
-        .set('Access-Control-Allow-Origin', '*')
-        .send(responseBody);
+      // No explicit Access-Control-Allow-Origin here: this used to hardcode
+      // `*`, silently overriding whatever `corsMiddleware` (mounted above)
+      // had already decided for the request's actual Origin — bypassing a
+      // configured allowlist for this one legacy route. Leaving the header
+      // corsMiddleware already set on the response keeps this route
+      // consistent with the rest of the API.
+      res.status(response.status).set(responseHeaders).send(responseBody);
     } catch (error) {
       logger.error('Failed to proxy function', { slug, error: String(error) });
       res.status(502).json({ error: error instanceof Error ? error.message : String(error) });

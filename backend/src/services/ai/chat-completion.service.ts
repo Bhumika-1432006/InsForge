@@ -340,10 +340,18 @@ export class ChatCompletionService {
    * Stream a chat response
    * @param messages - Array of messages for conversation
    * @param options - Chat options including model, temperature, webSearch, thinking, etc.
+   * @param signal - Aborts the in-flight upstream request (e.g. on client disconnect).
+   *   Passed straight to the OpenAI SDK call rather than only relied on via
+   *   generator `.return()`: a plain async generator suspended awaiting the
+   *   next upstream chunk can't be preempted by `.return()` — it only takes
+   *   effect once that pending read settles — so without this, cancelling
+   *   the route's loop stops it from requesting further chunks but leaves
+   *   the current upstream request running to completion regardless.
    */
   async *streamChat(
     messages: ChatMessageSchema[],
-    options: ChatCompletionOptions
+    options: ChatCompletionOptions,
+    signal?: AbortSignal
   ): AsyncGenerator<{
     chunk?: string;
     tokenUsage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number };
@@ -378,7 +386,10 @@ export class ChatCompletionService {
 
       // Send request with upstream error mapping
       const { result: stream } = await this.openRouterProvider.sendRequest((client) =>
-        client.chat.completions.create(request as OpenAI.Chat.ChatCompletionCreateParamsStreaming)
+        client.chat.completions.create(
+          request as OpenAI.Chat.ChatCompletionCreateParamsStreaming,
+          { signal }
+        )
       );
 
       const tokenUsage = {
@@ -462,6 +473,11 @@ export class ChatCompletionService {
         yield { annotations: collectedAnnotations };
       }
     } catch (error) {
+      // Deliberate cancellation (client disconnected), not a failure — the
+      // caller already knows and doesn't need this surfaced as an error.
+      if (signal?.aborted) {
+        return;
+      }
       if (error instanceof AppError) {
         throw error;
       }

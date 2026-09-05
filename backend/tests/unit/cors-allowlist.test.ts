@@ -119,6 +119,36 @@ describe('corsMiddleware', () => {
 
     expect(res.headers['access-control-allow-origin']).toBeUndefined();
   });
+
+  it('serves a stale allowlist without hitting the DB again on every request during an outage', async () => {
+    authConfigMock.getAuthConfig.mockResolvedValueOnce({
+      allowedRedirectUrls: ['https://app.example.com/callback'],
+    });
+    const app = await buildApp();
+
+    // Prime the cache with a successful fetch.
+    await request(app).get('/ping').set('Origin', 'https://app.example.com');
+    expect(authConfigMock.getAuthConfig).toHaveBeenCalledTimes(1);
+
+    // Force the cache to look expired, then start failing — mirroring a DB
+    // outage that lasts past the TTL.
+    authConfigMock.getAuthConfig.mockRejectedValue(new Error('db down'));
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() + 31_000);
+
+    const first = await request(app).get('/ping').set('Origin', 'https://app.example.com');
+    const second = await request(app).get('/ping').set('Origin', 'https://app.example.com');
+
+    vi.useRealTimers();
+
+    // Both requests should still be allowed (serving the stale list), and the
+    // failed refresh should only have been attempted once — the catch branch
+    // must re-arm the TTL, not leave every subsequent request re-entering the
+    // stale-cache branch and re-issuing a doomed DB read.
+    expect(first.headers['access-control-allow-origin']).toBe('https://app.example.com');
+    expect(second.headers['access-control-allow-origin']).toBe('https://app.example.com');
+    expect(authConfigMock.getAuthConfig).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('originMatchesPattern', () => {
@@ -127,15 +157,33 @@ describe('originMatchesPattern', () => {
     expect(originMatchesPattern('https://App.Example.com', 'https://app.example.com')).toBe(true);
   });
 
-  it('matches a single leading subdomain wildcard', async () => {
+  it('matches a leading subdomain wildcard', async () => {
     const { originMatchesPattern } = await import('../../src/api/middlewares/cors.js');
     expect(originMatchesPattern('https://*.example.com', 'https://a.b.example.com')).toBe(true);
     expect(originMatchesPattern('https://*.example.com', 'https://example.com')).toBe(false);
   });
 
-  it('rejects a port mismatch', async () => {
+  it('matches a wildcard placed mid-host, not just as a leading subdomain', async () => {
+    const { originMatchesPattern } = await import('../../src/api/middlewares/cors.js');
+    expect(originMatchesPattern('https://*foo.example.com', 'https://barfoo.example.com')).toBe(
+      true
+    );
+    expect(originMatchesPattern('https://*foo.example.com', 'https://foobar.example.com')).toBe(
+      false
+    );
+  });
+
+  it('rejects a non-default port mismatch', async () => {
     const { originMatchesPattern } = await import('../../src/api/middlewares/cors.js');
     expect(originMatchesPattern('https://example.com:8443', 'https://example.com')).toBe(false);
+  });
+
+  it('matches when a pattern spells out the scheme default port explicitly', async () => {
+    const { originMatchesPattern } = await import('../../src/api/middlewares/cors.js');
+    expect(originMatchesPattern('https://app.example.com:443', 'https://app.example.com')).toBe(
+      true
+    );
+    expect(originMatchesPattern('http://app.example.com:80', 'http://app.example.com')).toBe(true);
   });
 
   it('rejects an unparseable pattern', async () => {

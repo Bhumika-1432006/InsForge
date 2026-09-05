@@ -5,14 +5,23 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 /**
  * Regression test for issue #1895 (SSE Disconnect Token/Resource Leak): a
  * client disconnecting mid-stream from POST /api/ai/chat/completion used to
- * leave the server-side `for await` loop over the upstream provider stream
- * running to completion, continuing to consume AI tokens against a socket
- * nobody was reading.
+ * leave the server-side upstream request running to completion, continuing
+ * to consume AI tokens against a socket nobody was reading.
+ *
+ * The route cancels via an `AbortSignal` passed into `streamChat`, not via
+ * calling `.return()` on the generator: a plain async generator suspended
+ * awaiting its inner `for await` (waiting on the next upstream chunk, the
+ * common case) can't be preempted by `.return()` — verified empirically
+ * (see the PR description) that it only takes effect once that pending read
+ * settles on its own, by which point the upstream request already ran to
+ * completion regardless. The fake upstream below is a real `async
+ * function*` — like the production `ChatCompletionService.streamChat` — that
+ * reacts to the signal the same way a `fetch`-backed SDK call would, so this
+ * exercises the mechanism that actually matters.
  *
  * This spins up a real HTTP server (so the client can actually sever the
- * TCP connection) with a fake upstream generator standing in for the AI
- * provider stream, and asserts that destroying the client connection causes
- * the server to stop pulling further chunks from that generator.
+ * TCP connection) rather than mocking Express, so the 'close' event fires
+ * from a genuine socket teardown, not a simulated one.
  */
 
 vi.hoisted(() => {
@@ -41,70 +50,69 @@ vi.mock('../../src/providers/ai/openrouter.provider.js', () => ({
   OpenRouterProvider: { getInstance: () => ({}) },
 }));
 
-// A plain async generator can't be preempted mid-await by `.return()` — the
-// spec only lets `.return()` take effect once a call to `.next()` that's
-// already in flight settles (verified empirically; see PR description). The
-// real OpenAI SDK stream this route consumes isn't a plain generator: its
-// `.return()` aborts the underlying fetch via an AbortController, which
-// makes an *already pending* `.next()` settle early instead of producing a
-// further chunk. Modelling that (rather than a plain `async function*`) is
-// what actually exercises "does the route cancel promptly on disconnect".
 const generatorState = vi.hoisted(() => ({
-  returnCalled: false,
+  sawAbortedSignal: false,
   producedSecondChunk: false,
+  finallyRan: false,
 }));
 
 let releaseSecondChunk: (() => void) | null = null;
-let cancelPending: (() => void) | null = null;
 
-function createFakeUpstreamStream() {
-  const secondChunkReady = new Promise<'chunk'>((resolve) => {
-    releaseSecondChunk = () => resolve('chunk');
-  });
-  const cancelled = new Promise<'cancelled'>((resolve) => {
-    cancelPending = () => resolve('cancelled');
-  });
+// Stands in for ChatCompletionService.streamChat: an `await` that only
+// settles when either a real chunk arrives (`releaseSecondChunk`, standing in
+// for the network) or `signal` aborts — the same race a `fetch`/OpenAI SDK
+// call under an AbortSignal resolves.
+async function* fakeUpstreamStream(signal?: AbortSignal) {
+  try {
+    yield { chunk: 'first' };
 
-  let callCount = 0;
-  return {
-    [Symbol.asyncIterator]() {
-      return this;
-    },
-    async next() {
-      callCount += 1;
-      if (callCount === 1) {
-        return { value: { chunk: 'first' }, done: false };
+    await new Promise<void>((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(new DOMException('Aborted', 'AbortError'));
+        return;
       }
-      const winner = await Promise.race([secondChunkReady, cancelled]);
-      if (winner === 'cancelled') {
-        return { value: undefined, done: true };
-      }
-      generatorState.producedSecondChunk = true;
-      return { value: { chunk: 'second' }, done: false };
-    },
-    async return(value: unknown) {
-      generatorState.returnCalled = true;
-      cancelPending?.();
-      return { value, done: true };
-    },
-  };
+      const onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+      signal?.addEventListener('abort', onAbort, { once: true });
+      releaseSecondChunk = () => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      };
+    });
+
+    generatorState.producedSecondChunk = true;
+    yield { chunk: 'second' };
+  } catch (error) {
+    // Mirrors ChatCompletionService.streamChat's own catch: a deliberate
+    // abort ends the generator cleanly rather than surfacing as an error.
+    if (!(signal?.aborted && error instanceof DOMException)) {
+      throw error;
+    }
+    generatorState.sawAbortedSignal = true;
+  } finally {
+    generatorState.finallyRan = true;
+  }
 }
 
 vi.mock('../../src/services/ai/chat-completion.service.js', () => ({
   ChatCompletionService: {
     getInstance: () => ({
-      streamChat: () => createFakeUpstreamStream(),
+      streamChat: (
+        _messages: unknown,
+        _options: unknown,
+        signal?: AbortSignal
+      ) => fakeUpstreamStream(signal),
     }),
   },
 }));
 
 describe('POST /api/ai/chat/completion — client disconnect mid-stream', () => {
   beforeEach(() => {
-    generatorState.returnCalled = false;
+    generatorState.sawAbortedSignal = false;
     generatorState.producedSecondChunk = false;
+    generatorState.finallyRan = false;
   });
 
-  it('stops pulling from the upstream stream once the client disconnects', async () => {
+  it('aborts the in-flight upstream request once the client disconnects', async () => {
     const { aiRouter } = await import('../../src/api/routes/ai/index.routes.js');
     const app = express();
     app.use(express.json());
@@ -139,8 +147,8 @@ describe('POST /api/ai/chat/completion — client disconnect mid-stream', () => 
           (res) => {
             res.on('data', () => {
               // Received the first SSE chunk — sever the connection now,
-              // while the fake upstream's second `.next()` call is pending
-              // (racing `secondChunkReady` against `cancelled`).
+              // while the fake upstream is suspended awaiting the second
+              // chunk (i.e. mid-request, same as a real slow upstream).
               clientReq.destroy();
             });
           }
@@ -156,13 +164,15 @@ describe('POST /api/ai/chat/completion — client disconnect mid-stream', () => 
         clientReq.end();
       });
 
-      // Let the server-side 'close' listener run and call `.return()` before
-      // asserting. Then release the "real chunk" side of the race too — if
-      // the route had NOT cancelled, this is what would let a real upstream
-      // eventually produce the second chunk; asserting first proves the
-      // cancellation (not this release) is what ended the pending call.
+      // Let the server-side 'close' listener fire and the abort propagate
+      // through the fake upstream's pending await before asserting. Only
+      // then release the "real chunk" side of the race — if the route had
+      // NOT aborted, this is what would let a real upstream eventually
+      // produce the second chunk, so asserting first proves the abort (not
+      // this release) is what ended the pending request.
       await new Promise((resolve) => setTimeout(resolve, 50));
-      expect(generatorState.returnCalled).toBe(true);
+      expect(generatorState.sawAbortedSignal).toBe(true);
+      expect(generatorState.finallyRan).toBe(true);
       expect(generatorState.producedSecondChunk).toBe(false);
 
       releaseSecondChunk?.();

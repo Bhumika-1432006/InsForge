@@ -292,4 +292,127 @@ export default async function (req: Request): Promise<Response> {
     const response = await handler({});
     expect(await response.text()).toBe('module.exports = fake');
   });
+
+  // Round-3 regression coverage: a third review pass found the masker
+  // couldn't tell a regex literal from a string/comment (a quote or `//`
+  // inside a regex character class was misread as starting one), and that
+  // TypeScript's optional-parameter `?` was never stripped.
+
+  it('does not let a regex literal containing a quote character confuse string detection', () => {
+    const code = `const quotes = /['"]/;
+export default async function (req: Request): Promise<Response> {
+  return new Response(quotes.test("x") ? "yes" : "no");
+}`;
+
+    const result = normalizeHandlerFormat(code);
+    expect(result).toContain('module.exports = async function');
+    const wrapper = new Function('exports', 'module', result);
+    const exportsObj: Record<string, unknown> = {};
+    const moduleObj = { exports: exportsObj };
+    wrapper(exportsObj, moduleObj);
+    expect(typeof moduleObj.exports).toBe('function');
+  });
+
+  it('does not let a double slash inside a regex character class be read as a line comment', () => {
+    const code = `const pattern = /[//]/;
+export default async function (req: Request): Promise<Response> {
+  return new Response(pattern.source);
+}`;
+
+    const result = normalizeHandlerFormat(code);
+    expect(result).toContain('module.exports = async function');
+    const wrapper = new Function('exports', 'module', result);
+    const exportsObj: Record<string, unknown> = {};
+    const moduleObj = { exports: exportsObj };
+    wrapper(exportsObj, moduleObj);
+    expect(typeof moduleObj.exports).toBe('function');
+  });
+
+  it('does not mistake a division for a regex literal', () => {
+    const code = `const half = 10 / 2;
+export default async function (req: Request): Promise<Response> {
+  return new Response(String(half));
+}`;
+
+    const result = normalizeHandlerFormat(code);
+    expect(result).toContain('const half = 10 / 2;');
+  });
+
+  it('strips a TypeScript optional-parameter marker', () => {
+    const code = `export default async function (req?: Request): Promise<Response> {
+  return new Response("hi");
+}`;
+
+    const result = normalizeHandlerFormat(code);
+    expect(result).not.toMatch(/\?/);
+    const wrapper = new Function('exports', 'module', result);
+    const exportsObj: Record<string, unknown> = {};
+    const moduleObj = { exports: exportsObj };
+    wrapper(exportsObj, moduleObj);
+    expect(typeof moduleObj.exports).toBe('function');
+  });
+
+  it('strips an optional parameter alongside a typed, required one', () => {
+    const code = `export default async function (req: Request, opts?: Record<string, string>): Promise<Response> {
+  return new Response("hi");
+}`;
+
+    const result = normalizeHandlerFormat(code);
+    const wrapper = new Function('exports', 'module', result);
+    const exportsObj: Record<string, unknown> = {};
+    const moduleObj = { exports: exportsObj };
+    wrapper(exportsObj, moduleObj);
+    expect(typeof moduleObj.exports).toBe('function');
+  });
+});
+
+describe('functions/handler-format.js — Zeabur embedded copy stays in sync', () => {
+  // deploy/zeabur/template.yml inlines a standalone copy of this file for
+  // its embedded Deno runtime (that deployment target can't read a second
+  // local file at request time the way the other deploy targets do). A
+  // reviewer flagged that the two copies will silently drift if one is
+  // edited without the other — this test makes that impossible to miss.
+  it('embeds byte-identical content to functions/handler-format.js', () => {
+    // Plain string extraction rather than a real YAML parser: this only
+    // needs to locate one known block-scalar entry (by its fixed `- path:`
+    // marker and indentation) and dedent it — pulling in a YAML dependency
+    // for that would be more machinery than the check warrants.
+    const realSource = readFileSync(
+      join(__dirname, '../../../functions/handler-format.js'),
+      'utf-8'
+    );
+    const templatePath = join(__dirname, '../../../deploy/zeabur/template.yml');
+    // Normalized once here (rather than only at the final comparison) so the
+    // marker/slice logic below doesn't have to account for a CRLF checkout.
+    const templateSource = readFileSync(templatePath, 'utf-8').replace(/\r\n/g, '\n');
+
+    const startMarker =
+      '                - path: /app/functions/handler-format.js\n                  template: |\n';
+    const startIndex = templateSource.indexOf(startMarker);
+    expect(
+      startIndex,
+      'deploy/zeabur/template.yml is missing the handler-format.js config entry'
+    ).toBeGreaterThanOrEqual(0);
+
+    const contentStart = startIndex + startMarker.length;
+    const endMarker = '\n            healthCheck:';
+    const endIndex = templateSource.indexOf(endMarker, contentStart);
+    expect(
+      endIndex,
+      'could not find the end of the embedded handler-format.js block'
+    ).toBeGreaterThan(contentStart);
+
+    const indent = '                    ';
+    const dedented = templateSource
+      .slice(contentStart, endIndex)
+      .split('\n')
+      .map((line) => (line.startsWith(indent) ? line.slice(indent.length) : line))
+      .join('\n');
+
+    // Trailing-newline-insensitive: the embedded copy's block ends at the
+    // last content line (nothing meaningful follows it before `healthCheck:`
+    // in the YAML), while the real file ends with the newline every text
+    // file has — not a real difference worth failing this test over.
+    expect(dedented.replace(/\n$/, '')).toBe(realSource.replace(/\r\n/g, '\n').replace(/\n$/, ''));
+  });
 });

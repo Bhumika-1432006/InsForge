@@ -915,12 +915,64 @@ spec:
                      * tokenizer — doesn't need to be, since callers only use it to find *where*
                      * a pattern lexically starts, never to execute the masked text itself.
                      */
+                    // Characters after which a `/` is a value already produced (an identifier,
+                    // number, or a closing bracket) rather than the start of a regex literal —
+                    // e.g. `a / b` is division, `(x) / 2` is division. After anything else
+                    // (`(`, `,`, `=`, `:`, `return`, the start of the source, ...) a `/` starts
+                    // a regex literal — e.g. `return /foo/`, `x = /foo/`. This is the same
+                    // heuristic lightweight JS tokenizers use; it isn't a full parser, but a
+                    // statement can't otherwise begin with a bare `/`.
+                    const VALUE_END_CHAR_PATTERN = /[A-Za-z0-9_$)\]]/;
+
                     function maskNonCode(code) {
                       let result = '';
                       let i = 0;
+                      let lastSignificantChar = '';
                       while (i < code.length) {
                         const char = code[i];
                         const twoChars = code.slice(i, i + 2);
+
+                        if (char === '/' && !VALUE_END_CHAR_PATTERN.test(lastSignificantChar)) {
+                          // A regex literal. Its contents are irrelevant to every pattern below,
+                          // so it's fully blanked (delimiters included) — unlike a string, whose
+                          // quote characters are preserved (see below), nothing needs to see a
+                          // literal `/` here. Scanned first, before the comment checks: a
+                          // character class inside a regex can itself contain `/` or quote
+                          // characters (`/['"]/`, `/[//]/`) that would otherwise be misread as
+                          // starting a string or a `//` line comment.
+                          let j = i + 1;
+                          let inClass = false;
+                          let terminated = false;
+                          while (j < code.length && code[j] !== '\n') {
+                            if (code[j] === '\\') {
+                              j += 2;
+                              continue;
+                            }
+                            if (code[j] === '[') {
+                              inClass = true;
+                            } else if (code[j] === ']') {
+                              inClass = false;
+                            } else if (code[j] === '/' && !inClass) {
+                              j += 1;
+                              terminated = true;
+                              break;
+                            }
+                            j += 1;
+                          }
+                          if (terminated) {
+                            while (j < code.length && /[a-zA-Z]/.test(code[j])) {
+                              j += 1; // trailing flags (g, i, m, ...)
+                            }
+                            result += code.slice(i, j).replace(/[^\n]/g, ' ');
+                            lastSignificantChar = ')'; // a regex literal is itself a value
+                            i = j;
+                            continue;
+                          }
+                          // No closing `/` before end of line: not actually a regex literal
+                          // (or malformed code either way) — fall through and treat `/` as an
+                          // ordinary character rather than misidentifying a division operator
+                          // as an unterminated regex and masking the rest of the line.
+                        }
 
                         if (twoChars === '//') {
                           let j = i;
@@ -957,10 +1009,14 @@ spec:
                           const inner = code.slice(i + 1, innerEnd).replace(/[^\n]/g, ' ');
                           result += quote + inner + (closed ? quote : '');
                           i = closed ? j + 1 : innerEnd;
+                          lastSignificantChar = ')'; // a string literal is itself a value
                           continue;
                         }
 
                         result += char;
+                        if (!/\s/.test(char)) {
+                          lastSignificantChar = char;
+                        }
                         i += 1;
                       }
                       return result;
@@ -1105,6 +1161,11 @@ spec:
                           if (mode !== 'type') {
                             keep();
                           }
+                          continue;
+                        }
+                        if (depth === 0 && mode === 'name' && char === '?' && /^\s*:/.test(maskedSource.slice(i + 1))) {
+                          // TypeScript optional-parameter marker immediately before the type
+                          // annotation (`req?: Request`) — has no plain-JS analogue, drop it.
                           continue;
                         }
                         if (depth === 0 && mode === 'name' && char === ':') {

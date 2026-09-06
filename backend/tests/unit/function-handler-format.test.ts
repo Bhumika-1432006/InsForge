@@ -364,6 +364,105 @@ export default async function (req: Request): Promise<Response> {
     wrapper(exportsObj, moduleObj);
     expect(typeof moduleObj.exports).toBe('function');
   });
+
+  // Round-4 regression coverage: a fourth review pass found a keyword before
+  // a regex literal (`return /.../`) still misclassified, a return type
+  // separated from `)` by a line break not stripped, a comment inside an
+  // import's brace list defeating the known-binding check, an unbalanced
+  // relational operator in one parameter's default value corrupting a
+  // *later* parameter's type, and an export-default handler whose body
+  // happens to contain a `module.exports =`-shaped line being misread as
+  // the legacy format.
+
+  it('recognizes a regex literal immediately after the "return" keyword', () => {
+    const code = `function helper() { return /'foo/; }
+export default async function (req: Request): Promise<Response> {
+  return new Response(String(helper()));
+}`;
+
+    const result = normalizeHandlerFormat(code);
+    expect(result).toContain('module.exports = async function');
+    const wrapper = new Function('exports', 'module', result);
+    const exportsObj: Record<string, unknown> = {};
+    const moduleObj = { exports: exportsObj };
+    wrapper(exportsObj, moduleObj);
+    expect(typeof moduleObj.exports).toBe('function');
+  });
+
+  it('still treats a division after an identifier as division, not a regex', () => {
+    const code = `const half = 10 / 2;
+export default async function (req: Request): Promise<Response> {
+  return new Response(String(half));
+}`;
+
+    const result = normalizeHandlerFormat(code);
+    expect(result).toContain('const half = 10 / 2;');
+  });
+
+  it('strips a return type separated from the parameter list by a line break', () => {
+    const code = `export default async function (req: Request)
+  : Promise<Response> {
+  return new Response("hi");
+}`;
+
+    const result = normalizeHandlerFormat(code);
+    expect(result).not.toMatch(/Promise</);
+    const wrapper = new Function('exports', 'module', result);
+    const exportsObj: Record<string, unknown> = {};
+    const moduleObj = { exports: exportsObj };
+    wrapper(exportsObj, moduleObj);
+    expect(typeof moduleObj.exports).toBe('function');
+  });
+
+  it('resolves a known import even with a comment inside its brace list', async () => {
+    const code = `import { createClient /* the sdk client */ } from 'npm:@insforge/sdk';
+
+export default async function (req: Request): Promise<Response> {
+  const client = createClient({});
+  return new Response(typeof client);
+}`;
+
+    const result = normalizeHandlerFormat(code);
+    expect(result).not.toMatch(/\bimport\b/);
+
+    const wrapper = new Function('exports', 'module', 'createClient', result);
+    const exportsObj: Record<string, unknown> = {};
+    const moduleObj = { exports: exportsObj };
+    wrapper(exportsObj, moduleObj, () => ({}));
+    const handler = moduleObj.exports as (req: unknown) => Promise<{ text(): Promise<string> }>;
+    const response = await handler({});
+    expect(await response.text()).toBe('object');
+  });
+
+  it('does not let an unbalanced relational operator in one default value corrupt a later parameter', () => {
+    const code = `export default async function (a = 1 < 2, b: Request): Promise<Response> {
+  return new Response("hi");
+}`;
+
+    const result = normalizeHandlerFormat(code);
+    expect(result).not.toMatch(/:\s*Request/);
+    const wrapper = new Function('exports', 'module', result);
+    const exportsObj: Record<string, unknown> = {};
+    const moduleObj = { exports: exportsObj };
+    wrapper(exportsObj, moduleObj);
+    expect(typeof moduleObj.exports).toBe('function');
+  });
+
+  it('rewrites export default even when a comment in the body looks like a legacy assignment', () => {
+    const code = `export default async function (req: Request): Promise<Response> {
+  // module.exports = something (just a comment, not a real assignment)
+  return new Response("hi");
+}`;
+
+    const result = normalizeHandlerFormat(code);
+    expect(result).not.toMatch(/export\s+default/);
+    expect(result).toMatch(/^module\.exports = async function/);
+    const wrapper = new Function('exports', 'module', result);
+    const exportsObj: Record<string, unknown> = {};
+    const moduleObj = { exports: exportsObj };
+    wrapper(exportsObj, moduleObj);
+    expect(typeof moduleObj.exports).toBe('function');
+  });
 });
 
 describe('functions/handler-format.js — Zeabur embedded copy stays in sync', () => {

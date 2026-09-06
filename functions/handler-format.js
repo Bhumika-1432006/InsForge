@@ -59,15 +59,59 @@
 // statement can't otherwise begin with a bare `/`.
 const VALUE_END_CHAR_PATTERN = /[A-Za-z0-9_$)\]]/;
 
+// A word immediately before `/` that ends in a "value-like" character
+// doesn't always mean a value was produced — these keywords all precede an
+// operand, not end one (`return /foo/`, `typeof /foo/`), so `/` right after
+// one of them still starts a regex literal despite ending in a letter.
+const REGEX_PERMITTING_KEYWORDS = new Set([
+  'return',
+  'typeof',
+  'instanceof',
+  'in',
+  'of',
+  'new',
+  'delete',
+  'void',
+  'throw',
+  'case',
+  'do',
+  'else',
+  'yield',
+  'await',
+]);
+
+function isRegexLiteralStart(lastSignificantChar, lastWord) {
+  if (lastSignificantChar === '') {
+    return true;
+  }
+  if (VALUE_END_CHAR_PATTERN.test(lastSignificantChar)) {
+    return REGEX_PERMITTING_KEYWORDS.has(lastWord);
+  }
+  return true;
+}
+
+const WORD_CHAR_PATTERN = /[A-Za-z0-9_$]/;
+
 function maskNonCode(code) {
   let result = '';
   let i = 0;
   let lastSignificantChar = '';
+  let lastWord = '';
+  let currentWord = '';
   while (i < code.length) {
     const char = code[i];
     const twoChars = code.slice(i, i + 2);
 
-    if (char === '/' && !VALUE_END_CHAR_PATTERN.test(lastSignificantChar)) {
+    // Commit the word in progress the moment it ends — including right
+    // here, before using `lastWord` below — so `a/b` (no separator between
+    // the identifier and the `/`) sees the word that just ended instead of
+    // a stale one from further back.
+    if (!WORD_CHAR_PATTERN.test(char) && currentWord) {
+      lastWord = currentWord;
+      currentWord = '';
+    }
+
+    if (char === '/' && isRegexLiteralStart(lastSignificantChar, lastWord)) {
       // A regex literal. Its contents are irrelevant to every pattern below,
       // so it's fully blanked (delimiters included) — unlike a string, whose
       // quote characters are preserved (see below), nothing needs to see a
@@ -100,6 +144,7 @@ function maskNonCode(code) {
         }
         result += code.slice(i, j).replace(/[^\n]/g, ' ');
         lastSignificantChar = ')'; // a regex literal is itself a value
+        lastWord = ''; // ...not a keyword, so a following `/` means division
         i = j;
         continue;
       }
@@ -145,10 +190,16 @@ function maskNonCode(code) {
       result += quote + inner + (closed ? quote : '');
       i = closed ? j + 1 : innerEnd;
       lastSignificantChar = ')'; // a string literal is itself a value
+      lastWord = ''; // ...not a keyword, so a following `/` means division
       continue;
     }
 
     result += char;
+    if (WORD_CHAR_PATTERN.test(char)) {
+      currentWord += char;
+    }
+    // (the non-word case is already handled at the top of the loop, before
+    // `lastWord` is read for this same character)
     if (!/\s/.test(char)) {
       lastSignificantChar = char;
     }
@@ -190,11 +241,13 @@ const IMPORT_STATEMENT_PATTERN =
  */
 function resolveKnownImports(code) {
   const masked = maskNonCode(code);
-  // 'd' adds match.indices, so the specifier list and source are read back
-  // from the original `code` at those positions — the masked text is only
-  // used to find real (non-string/comment) import statements; its capture
-  // groups are blanked and unusable as content (the whole point of masking
-  // the source string is that it's blanked).
+  // 'd' adds match.indices to locate each match precisely. The specifier
+  // list is read from the *masked* text — a comment inside the braces
+  // (`{ createClient /* the sdk client */ }`) would otherwise end up as
+  // part of a "specifier" and fail the known-binding check, leaving the
+  // whole import untouched even though it's a plain, resolvable one. The
+  // source string, in contrast, is read from the original `code`: it's a
+  // quoted string, which can't itself contain a code comment.
   const pattern = new RegExp(IMPORT_STATEMENT_PATTERN.source, IMPORT_STATEMENT_PATTERN.flags + 'd');
 
   let result = '';
@@ -204,7 +257,7 @@ function resolveKnownImports(code) {
     const fullMatch = match[0];
     const [specifierStart, specifierEnd] = match.indices[1];
     const [sourceStart, sourceEnd] = match.indices[3];
-    const specifierList = code.slice(specifierStart, specifierEnd);
+    const specifierList = masked.slice(specifierStart, specifierEnd);
     const source = code.slice(sourceStart, sourceEnd);
     result += code.slice(lastIndex, match.index);
 
@@ -284,18 +337,31 @@ function stripParamTypeAnnotations(originalSource, maskedSource) {
       result += originalSource[i];
     };
 
-    if ('([{<'.includes(char)) {
+    if ('([{'.includes(char)) {
       depth += 1;
       if (mode !== 'type') {
         keep();
       }
       continue;
     }
-    if (')]}>'.includes(char)) {
+    if (')]}'.includes(char)) {
       depth = Math.max(0, depth - 1);
       if (mode !== 'type') {
         keep();
       }
+      continue;
+    }
+    // `<`/`>` only mean generic nesting while inside a type annotation.
+    // Outside one — a default value's own expression — they're relational
+    // operators (`opts = x < 10 ? a : b`), and counting them as brackets
+    // there would desync depth against an unmatched `<` with no `>`,
+    // leaving a *later* parameter's real type annotation unstripped.
+    if (mode === 'type' && char === '<') {
+      depth += 1;
+      continue;
+    }
+    if (mode === 'type' && char === '>' && depth > 0) {
+      depth -= 1;
       continue;
     }
     if (depth === 0 && mode === 'name' && char === '?' && /^\s*:/.test(maskedSource.slice(i + 1))) {
@@ -340,7 +406,9 @@ function stripParamTypeAnnotations(originalSource, maskedSource) {
  * (`Promise<{ status: number }>`) isn't truncated mid-type.
  */
 function stripReturnType(originalAfterParams, maskedAfterParams) {
-  const colonMatch = /^[ \t]*:/.exec(maskedAfterParams);
+  // `\s`, not `[ \t]`: the colon may be on its own line after the closing
+  // paren (an unusual but valid line-break before `: ReturnType`).
+  const colonMatch = /^\s*:/.exec(maskedAfterParams);
   if (!colonMatch) {
     return originalAfterParams;
   }
@@ -418,7 +486,13 @@ function stripHandlerSignatureTypes(code, fromIndex) {
 }
 
 function normalizeHandlerFormat(code) {
-  if (LEGACY_ASSIGNMENT_PATTERN.test(maskNonCode(code))) {
+  // Checked first, and only as the deciding factor when there's no
+  // `export default` at all: a genuine `export default` handler could
+  // still contain a line starting with `module.exports =` somewhere in its
+  // *body* (unusual, but not impossible — e.g. mixed CommonJS/ESM idioms),
+  // and that must not short-circuit the rewrite this function exists to do.
+  const hasExportDefault = /(^|\n)([ \t]*)export\s+default\s+/.test(maskNonCode(code));
+  if (!hasExportDefault && LEGACY_ASSIGNMENT_PATTERN.test(maskNonCode(code))) {
     return code;
   }
 

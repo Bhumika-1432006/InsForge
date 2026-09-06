@@ -80,12 +80,15 @@ const REGEX_PERMITTING_KEYWORDS = new Set([
   'await',
 ]);
 
-function isRegexLiteralStart(lastSignificantChar, lastWord) {
+function isRegexLiteralStart(lastSignificantChar, lastWord, lastWordIsProperty) {
   if (lastSignificantChar === '') {
     return true;
   }
   if (VALUE_END_CHAR_PATTERN.test(lastSignificantChar)) {
-    return REGEX_PERMITTING_KEYWORDS.has(lastWord);
+    // A property named after one of these keywords (`obj.delete`, `obj.in`)
+    // is still a value, not the keyword itself — only an unqualified use
+    // permits a following regex.
+    return !lastWordIsProperty && REGEX_PERMITTING_KEYWORDS.has(lastWord);
   }
   return true;
 }
@@ -97,21 +100,35 @@ function maskNonCode(code) {
   let i = 0;
   let lastSignificantChar = '';
   let lastWord = '';
+  let lastWordIsProperty = false;
   let currentWord = '';
+  let currentWordIsProperty = false;
   while (i < code.length) {
     const char = code[i];
     const twoChars = code.slice(i, i + 2);
 
     // Commit the word in progress the moment it ends — including right
-    // here, before using `lastWord` below — so `a/b` (no separator between
-    // the identifier and the `/`) sees the word that just ended instead of
-    // a stale one from further back.
+    // here, before `lastWord` is read below — so `a/b` (no separator
+    // between the identifier and the `/`) sees the word that just ended
+    // instead of a stale one from further back.
     if (!WORD_CHAR_PATTERN.test(char) && currentWord) {
       lastWord = currentWord;
+      lastWordIsProperty = currentWordIsProperty;
       currentWord = '';
     }
 
-    if (char === '/' && isRegexLiteralStart(lastSignificantChar, lastWord)) {
+    // `twoChars !== '//' && twoChars !== '/*'`: an empty regex literal
+    // (`//`) isn't valid JS grammar (a regex body needs at least one
+    // character), so `//` is always a comment — never division-then-regex
+    // or an empty regex that happens to look like one — and must be
+    // recognized before regex detection gets a chance to misread it (or
+    // `/*`'s opening slash) as a literal.
+    if (
+      char === '/' &&
+      twoChars !== '//' &&
+      twoChars !== '/*' &&
+      isRegexLiteralStart(lastSignificantChar, lastWord, lastWordIsProperty)
+    ) {
       // A regex literal. Its contents are irrelevant to every pattern below,
       // so it's fully blanked (delimiters included) — unlike a string, whose
       // quote characters are preserved (see below), nothing needs to see a
@@ -145,6 +162,7 @@ function maskNonCode(code) {
         result += code.slice(i, j).replace(/[^\n]/g, ' ');
         lastSignificantChar = ')'; // a regex literal is itself a value
         lastWord = ''; // ...not a keyword, so a following `/` means division
+        lastWordIsProperty = false;
         i = j;
         continue;
       }
@@ -191,11 +209,15 @@ function maskNonCode(code) {
       i = closed ? j + 1 : innerEnd;
       lastSignificantChar = ')'; // a string literal is itself a value
       lastWord = ''; // ...not a keyword, so a following `/` means division
+      lastWordIsProperty = false;
       continue;
     }
 
     result += char;
     if (WORD_CHAR_PATTERN.test(char)) {
+      if (!currentWord) {
+        currentWordIsProperty = lastSignificantChar === '.';
+      }
       currentWord += char;
     }
     // (the non-word case is already handled at the top of the loop, before

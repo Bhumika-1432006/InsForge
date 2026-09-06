@@ -336,6 +336,14 @@ export default async function (req: Request): Promise<Response> {
 
     const result = normalizeHandlerFormat(code);
     expect(result).toContain('const half = 10 / 2;');
+    // Not just a string check: a misidentified regex here would have masked
+    // through to (and hidden) the `export default` below it, so the handler
+    // must also still actually be there and compilable.
+    const wrapper = new Function('exports', 'module', result);
+    const exportsObj: Record<string, unknown> = {};
+    const moduleObj = { exports: exportsObj };
+    wrapper(exportsObj, moduleObj);
+    expect(typeof moduleObj.exports).toBe('function');
   });
 
   it('strips a TypeScript optional-parameter marker', () => {
@@ -457,6 +465,95 @@ export default async function (req: Request): Promise<Response> {
     const result = normalizeHandlerFormat(code);
     expect(result).not.toMatch(/export\s+default/);
     expect(result).toMatch(/^module\.exports = async function/);
+    const wrapper = new Function('exports', 'module', result);
+    const exportsObj: Record<string, unknown> = {};
+    const moduleObj = { exports: exportsObj };
+    wrapper(exportsObj, moduleObj);
+    expect(typeof moduleObj.exports).toBe('function');
+  });
+
+  // Round-5 regression coverage: a fifth review pass found that `//` was
+  // reaching the regex-literal scanner before the comment handler ever got
+  // a chance to run (an empty regex literal isn't valid JS grammar, but the
+  // scanner didn't know that), and that a property merely *named* after a
+  // regex-permitting keyword (`obj.delete`, `obj.new`) was still treated as
+  // that keyword instead of as the value it actually is.
+
+  it('does not let a line comment be misread as an empty regex literal, hiding its content', () => {
+    // Before the fix, `//` was masked as if it were a 2-character regex
+    // literal, then the runtime lost track of being inside a comment at
+    // all — leaving the rest of the line, including this fake assignment
+    // text, unmasked and visible to LEGACY_ASSIGNMENT_PATTERN.
+    const code = `// module.exports = fake
+export default async function (req: Request): Promise<Response> {
+  return new Response("hi");
+}`;
+
+    const result = normalizeHandlerFormat(code);
+    expect(result).not.toMatch(/^module\.exports = fake/m);
+    const wrapper = new Function('exports', 'module', result);
+    const exportsObj: Record<string, unknown> = {};
+    const moduleObj = { exports: exportsObj };
+    wrapper(exportsObj, moduleObj);
+    expect(typeof moduleObj.exports).toBe('function');
+  });
+
+  it('does not let a comment containing "export default" become a second, malformed rewrite target', () => {
+    const code = `// export default fake_thing
+export default async function (req: Request): Promise<Response> {
+  return new Response("hi");
+}`;
+
+    const result = normalizeHandlerFormat(code);
+    // The comment's fake "export default" must not be the one rewritten —
+    // only the real handler below it.
+    expect(result).toMatch(/\/\/ export default fake_thing/);
+    const wrapper = new Function('exports', 'module', result);
+    const exportsObj: Record<string, unknown> = {};
+    const moduleObj = { exports: exportsObj };
+    wrapper(exportsObj, moduleObj);
+    expect(typeof moduleObj.exports).toBe('function');
+  });
+
+  it('does not let a block comment containing fake code reach the rewrite', () => {
+    const code = `/* module.exports = fake; export default fake2; */
+export default async function (req: Request): Promise<Response> {
+  return new Response("hi");
+}`;
+
+    const result = normalizeHandlerFormat(code);
+    const wrapper = new Function('exports', 'module', result);
+    const exportsObj: Record<string, unknown> = {};
+    const moduleObj = { exports: exportsObj };
+    wrapper(exportsObj, moduleObj);
+    expect(typeof moduleObj.exports).toBe('function');
+  });
+
+  it('treats a property named after a regex-permitting keyword as a value, not the keyword', () => {
+    const code = `const stats = { delete: 10 };
+const ratio = stats.delete / 2;
+export default async function (req: Request): Promise<Response> {
+  return new Response(String(ratio));
+}`;
+
+    const result = normalizeHandlerFormat(code);
+    expect(result).toContain('const ratio = stats.delete / 2;');
+    const wrapper = new Function('exports', 'module', result);
+    const exportsObj: Record<string, unknown> = {};
+    const moduleObj = { exports: exportsObj };
+    wrapper(exportsObj, moduleObj);
+    expect(typeof moduleObj.exports).toBe('function');
+  });
+
+  it('still strips a later typed parameter after a division on a keyword-named property', () => {
+    const code = `const stats = { new: 10, total: 20 };
+const ratio = stats.new / stats.total;
+export default async function (req: Request, opts: Record<string, string>): Promise<Response> {
+  return new Response(String(ratio));
+}`;
+
+    const result = normalizeHandlerFormat(code);
+    expect(result).not.toMatch(/opts:\s*Record/);
     const wrapper = new Function('exports', 'module', result);
     const exportsObj: Record<string, unknown> = {};
     const moduleObj = { exports: exportsObj };

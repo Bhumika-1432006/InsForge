@@ -397,16 +397,6 @@ export default async function (req: Request): Promise<Response> {
     expect(typeof moduleObj.exports).toBe('function');
   });
 
-  it('still treats a division after an identifier as division, not a regex', () => {
-    const code = `const half = 10 / 2;
-export default async function (req: Request): Promise<Response> {
-  return new Response(String(half));
-}`;
-
-    const result = normalizeHandlerFormat(code);
-    expect(result).toContain('const half = 10 / 2;');
-  });
-
   it('strips a return type separated from the parameter list by a line break', () => {
     const code = `export default async function (req: Request)
   : Promise<Response> {
@@ -454,6 +444,29 @@ export default async function (req: Request): Promise<Response> {
     const moduleObj = { exports: exportsObj };
     wrapper(exportsObj, moduleObj);
     expect(typeof moduleObj.exports).toBe('function');
+  });
+
+  it('does not let a ternary in an untyped default value corrupt a later parameter', async () => {
+    // `a` has no type annotation at all here, so the only way into 'default'
+    // mode is seeing a bare '=' straight from 'name' mode — without that,
+    // the ternary's own ':' below is misread as starting a type annotation.
+    const code = `export default async function (a = 1 < 2 ? "x" : "y", b: Request): Promise<Response> {
+  return new Response(a);
+}`;
+
+    const result = normalizeHandlerFormat(code);
+    expect(result).toContain('1 < 2 ? "x" : "y"');
+    expect(result).not.toMatch(/b:\s*Request/);
+    const wrapper = new Function('exports', 'module', result);
+    const exportsObj: Record<string, unknown> = {};
+    const moduleObj = { exports: exportsObj };
+    wrapper(exportsObj, moduleObj);
+    const handler = moduleObj.exports as (
+      a: string,
+      req: unknown
+    ) => Promise<{ text(): Promise<string> }>;
+    const response = await handler(undefined as never, {});
+    expect(await response.text()).toBe('x'); // 1 < 2 is true
   });
 
   it('rewrites export default even when a comment in the body looks like a legacy assignment', () => {

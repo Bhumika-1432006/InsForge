@@ -395,6 +395,15 @@ function stripParamTypeAnnotations(originalSource, maskedSource) {
       mode = 'type';
       continue;
     }
+    if (depth === 0 && mode === 'name' && char === '=') {
+      // A default value with no type annotation at all (`a = x < y ? z : q`).
+      // Without this, `mode` would stay 'name' — the only other path into
+      // 'default' requires having seen a ':' first — so a ternary's own
+      // ':' further down would be misread as starting a type annotation.
+      mode = 'default';
+      keep();
+      continue;
+    }
     if (depth === 0 && mode === 'type' && char === '=' && maskedSource[i + 1] === '>') {
       // Function-type arrow (`() => void`) — part of the type, not a
       // default-value marker. Stays in type mode; both chars are dropped.

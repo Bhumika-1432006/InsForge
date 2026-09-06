@@ -474,7 +474,12 @@ export class ChatCompletionService {
     } catch (error) {
       // Deliberate cancellation (client disconnected), not a failure — the
       // caller already knows and doesn't need this surfaced as an error.
+      // Still logged (not as an error) so a genuine upstream failure that
+      // happened to coincide with the disconnect isn't silently invisible.
       if (signal?.aborted) {
+        logger.info('Stream aborted on client disconnect', {
+          error: error instanceof Error ? error.message : String(error),
+        });
         return;
       }
       if (error instanceof AppError) {

@@ -1,24 +1,20 @@
 import express from 'express';
-import helmet from 'helmet';
 import request from 'supertest';
 import { describe, expect, it } from 'vitest';
+import { helmetMiddleware } from '../../src/api/middlewares/helmet.js';
 
 /**
  * Regression test for issue #1895 (Missing HTTP Security Headers): API
- * responses previously carried none of Helmet's defensive headers. This
- * exercises the exact Helmet configuration wired into `createApp()`
- * (backend/src/server.ts) rather than re-deriving it, so a change there is
- * caught here too.
+ * responses previously carried none of Helmet's defensive headers.
+ *
+ * Imports the real `helmetMiddleware` server.ts wires into `createApp()`
+ * (backend/src/api/middlewares/helmet.ts) rather than re-deriving the
+ * config here — a hand-duplicated copy would keep passing even if the real
+ * one drifted or regressed.
  */
 function buildApp() {
   const app = express();
-  app.use(
-    helmet({
-      contentSecurityPolicy: false,
-      crossOriginResourcePolicy: false,
-      crossOriginEmbedderPolicy: false,
-    })
-  );
+  app.use(helmetMiddleware);
   app.get('/ping', (_req, res) => res.json({ ok: true }));
   return app;
 }
@@ -41,5 +37,11 @@ describe('Helmet security headers', () => {
     // are deliberately fetched cross-origin by client apps.
     expect(res.headers['content-security-policy']).toBeUndefined();
     expect(res.headers['cross-origin-resource-policy']).toBeUndefined();
+  });
+
+  it('allows the cloud-hosting window.opener bridge (same-origin-allow-popups)', async () => {
+    const res = await request(buildApp()).get('/ping');
+
+    expect(res.headers['cross-origin-opener-policy']).toBe('same-origin-allow-popups');
   });
 });

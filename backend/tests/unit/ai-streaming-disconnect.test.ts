@@ -28,6 +28,22 @@ vi.hoisted(() => {
   process.env.JWT_SECRET = 'test-secret-long-enough-for-signing-32chars';
 });
 
+/**
+ * Polls `condition` instead of sleeping a fixed duration before a critical
+ * assertion — a fixed delay assumes the server-side 'close' handler always
+ * runs within that window, which a slow/loaded CI runner can violate and
+ * turn into a flaky false failure.
+ */
+async function waitFor(condition: () => boolean, timeoutMs = 2000, intervalMs = 5): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) {
+      throw new Error(`waitFor: condition not met within ${timeoutMs}ms`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
+
 vi.mock('../../src/api/middlewares/auth.js', () => ({
   verifyAdmin: (_req: unknown, _res: unknown, next: () => void) => next(),
   verifyUser: (_req: unknown, _res: unknown, next: () => void) => next(),
@@ -167,12 +183,13 @@ describe('POST /api/ai/chat/completion — client disconnect mid-stream', () => 
       // NOT aborted, this is what would let a real upstream eventually
       // produce the second chunk, so asserting first proves the abort (not
       // this release) is what ended the pending request.
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      expect(generatorState.sawAbortedSignal).toBe(true);
-      expect(generatorState.finallyRan).toBe(true);
+      await waitFor(() => generatorState.sawAbortedSignal && generatorState.finallyRan);
       expect(generatorState.producedSecondChunk).toBe(false);
 
       releaseSecondChunk?.();
+      // Give the (deliberately unresolved-until-now) release a turn to
+      // resolve should the abort have failed to win the race, then confirm
+      // it still didn't produce a chunk.
       await new Promise((resolve) => setTimeout(resolve, 20));
       expect(generatorState.producedSecondChunk).toBe(false);
     } finally {

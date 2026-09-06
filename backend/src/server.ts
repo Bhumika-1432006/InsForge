@@ -1,5 +1,4 @@
 import express, { Request, Response, NextFunction } from 'express';
-import helmet from 'helmet';
 import cookieParser from 'cookie-parser';
 import dotenv from 'dotenv';
 import path from 'path';
@@ -26,6 +25,7 @@ import { paymentsRouter } from '@/api/routes/payments/index.routes.js';
 import { advisorRouter } from '@/api/routes/advisor/index.routes.js';
 import { errorMiddleware } from '@/api/middlewares/error.js';
 import { corsMiddleware } from '@/api/middlewares/cors.js';
+import { helmetMiddleware } from '@/api/middlewares/helmet.js';
 import { destroyEmailCooldownInterval } from '@/api/middlewares/rate-limiters.js';
 import { isCloudEnvironment } from '@/utils/environment.js';
 import { RealtimeManager } from '@/infra/realtime/realtime.manager.js';
@@ -92,25 +92,7 @@ export async function createApp() {
   app.set('trust proxy', appConfig.server.trustProxy);
 
   // Basic middleware
-  app.use(
-    helmet({
-      // The dashboard SPA and client apps embed third-party scripts/styles/images
-      // this project doesn't control, so a strict default CSP would break them;
-      // this hardening is scoped to the explicit header list below instead.
-      contentSecurityPolicy: false,
-      // Storage objects and API responses are deliberately fetched cross-origin
-      // by client apps (that's the point of a hosted backend), so the
-      // same-origin default here would break exactly the traffic this API serves.
-      crossOriginResourcePolicy: false,
-      crossOriginEmbedderPolicy: false,
-      // Helmet's default ('same-origin') severs `window.opener` for a popup
-      // opened from a different origin, breaking the cloud-hosting dashboard's
-      // opener-messaging bridge (frontend/src/cloud-hosting/useCloudHosting.ts,
-      // packages/dashboard/src/layout/AppLayout.tsx). This keeps the isolation
-      // benefit for same-origin popups while still allowing that bridge.
-      crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' },
-    })
-  );
+  app.use(helmetMiddleware);
   app.use(corsMiddleware);
   app.use(cookieParser()); // Parse cookies for refresh token handling
   app.use((req: Request, res: Response, next: NextFunction) => {
@@ -308,10 +290,22 @@ export async function createApp() {
       // - connection: hop-by-hop header
       // - content-encoding: node-fetch already decompresses the response,
       //   so we must not tell the client it's still compressed
+      // - access-control-allow-origin/-credentials: an edge function's own
+      //   CORS headers (several example functions set these) must not
+      //   override what corsMiddleware already decided for this request's
+      //   actual Origin — forwarding them would let any function reopen the
+      //   allowlist this PR exists to enforce, on this one legacy route.
       const responseHeaders: Record<string, string> = {};
       for (const [key, value] of response.headers.entries()) {
         if (
-          ['transfer-encoding', 'content-length', 'connection', 'content-encoding'].includes(key)
+          [
+            'transfer-encoding',
+            'content-length',
+            'connection',
+            'content-encoding',
+            'access-control-allow-origin',
+            'access-control-allow-credentials',
+          ].includes(key)
         ) {
           continue;
         }

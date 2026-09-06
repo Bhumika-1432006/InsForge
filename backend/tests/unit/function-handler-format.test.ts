@@ -225,7 +225,7 @@ export default async function (req: Request): Promise<Response> {
     expect(await response.text()).toBe('a');
   });
 
-  it("does not treat a function-type parameter's arrow as a default-value marker", () => {
+  it('does not treat a function-type parameter arrow as a default-value marker', () => {
     const code = `export default async function (req: Request, cb: () => void): Promise<Response> {
   cb();
   return new Response("hi");

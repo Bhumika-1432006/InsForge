@@ -24,19 +24,21 @@ describe('Helmet security headers', () => {
     const res = await request(buildApp()).get('/ping');
 
     expect(res.headers['x-content-type-options']).toBe('nosniff');
-    expect(res.headers['x-frame-options']).toBe('SAMEORIGIN');
     expect(res.headers['x-dns-prefetch-control']).toBe('off');
     expect(res.headers['strict-transport-security']).toContain('max-age=');
   });
 
-  it('does not set a CSP or cross-origin-resource-policy header (deliberately disabled)', async () => {
+  it('does not set a CSP, cross-origin-resource-policy, or X-Frame-Options header (deliberately disabled)', async () => {
     const res = await request(buildApp()).get('/ping');
 
     // Disabled on purpose: the dashboard SPA and client-embedded content
-    // aren't compatible with Helmet's default CSP, and storage/API responses
-    // are deliberately fetched cross-origin by client apps.
+    // aren't compatible with Helmet's default CSP, storage/API responses are
+    // deliberately fetched cross-origin by client apps, and the dashboard is
+    // deliberately embeddable in a cloud-hosting partner's cross-origin
+    // parent iframe (X-Frame-Options: SAMEORIGIN would block that).
     expect(res.headers['content-security-policy']).toBeUndefined();
     expect(res.headers['cross-origin-resource-policy']).toBeUndefined();
+    expect(res.headers['x-frame-options']).toBeUndefined();
   });
 
   it('allows the cloud-hosting window.opener bridge (same-origin-allow-popups)', async () => {

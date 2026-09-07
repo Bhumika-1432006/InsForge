@@ -23,4 +23,10 @@ export const helmetMiddleware: RequestHandler = helmet({
   // packages/dashboard/src/layout/AppLayout.tsx). This keeps the isolation
   // benefit for same-origin popups while still allowing that bridge.
   crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' },
+  // Helmet's default X-Frame-Options ('SAMEORIGIN') would stop the dashboard
+  // from rendering at all in the cloud-hosting partner's cross-origin parent
+  // iframe — useCloudHosting.ts documents that PROJECT_INFO only ever
+  // arrives from a parent iframe, i.e. that embed is a supported, expected
+  // flow, not something to guard against.
+  frameguard: false,
 });

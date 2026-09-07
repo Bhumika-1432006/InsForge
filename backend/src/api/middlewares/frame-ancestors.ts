@@ -12,6 +12,12 @@ import logger from '@/utils/logger.js';
  * from `https://config.insforge.dev/partnership.json`
  * (frontend/src/cloud-hosting/partner.service.ts), so only that trusted
  * partner — not the entire web — can frame these pages.
+ *
+ * This middleware is mounted globally, ahead of every route including health
+ * checks and webhooks, so it must never make a request wait on the outbound
+ * fetch to config.insforge.dev: it always applies the header synchronously
+ * from whatever is already cached (or 'self' only, before the first fetch
+ * ever completes) and refreshes the cache in the background.
  */
 
 const PARTNERSHIP_CONFIG_URL = 'https://config.insforge.dev/partnership.json';
@@ -19,7 +25,7 @@ const PARTNER_ORIGINS_CACHE_MS = 30_000;
 const FETCH_TIMEOUT_MS = 5_000;
 
 let cache: { partnerOrigins: string[]; fetchedAt: number } | null = null;
-let refreshPromise: Promise<string[]> | null = null;
+let refreshPromise: Promise<void> | null = null;
 
 async function fetchPartnerOrigins(): Promise<string[]> {
   const controller = new AbortController();
@@ -48,61 +54,50 @@ async function fetchPartnerOrigins(): Promise<string[]> {
   }
 }
 
-async function getPartnerOrigins(): Promise<string[]> {
-  const now = Date.now();
-  if (cache && now - cache.fetchedAt < PARTNER_ORIGINS_CACHE_MS) {
-    return cache.partnerOrigins;
+// Kicks off a refresh without making any caller wait on it. Concurrent
+// requests that all see a stale/missing cache in the same tick coalesce into
+// a single outbound fetch instead of each starting their own.
+function refreshPartnerOriginsInBackground(): void {
+  if (refreshPromise) {
+    return;
   }
-
-  // Coalesce concurrent refreshes into a single outbound request.
-  if (!refreshPromise) {
-    refreshPromise = fetchPartnerOrigins()
-      .then((partnerOrigins) => {
-        cache = { partnerOrigins, fetchedAt: Date.now() };
-        return partnerOrigins;
-      })
-      .catch((error) => {
-        // A stale-but-known-good list is safer to keep serving than dropping
-        // the partner from the policy (which would break the embed) or
-        // failing the request outright. With no prior successful fetch there
-        // is nothing to fall back to, so the caller gets an empty list and
-        // the policy degrades to 'self' only until a fetch succeeds.
-        if (cache) {
-          logger.error(
-            'Failed to refresh partner origins for frame-ancestors; keeping previous list',
-            {
-              error,
-            }
-          );
-          cache.fetchedAt = Date.now();
-          return cache.partnerOrigins;
-        }
+  refreshPromise = fetchPartnerOrigins()
+    .then((partnerOrigins) => {
+      cache = { partnerOrigins, fetchedAt: Date.now() };
+    })
+    .catch((error) => {
+      if (cache) {
+        logger.error(
+          'Failed to refresh partner origins for frame-ancestors; keeping previous list',
+          { error }
+        );
+        // Re-arm the TTL against this failed attempt too, so a sustained
+        // outage doesn't retry on every single request.
+        cache.fetchedAt = Date.now();
+      } else {
         logger.error(
           'Failed to fetch partner origins for frame-ancestors; defaulting to self only',
-          {
-            error,
-          }
+          { error }
         );
-        return [];
-      })
-      .finally(() => {
-        refreshPromise = null;
-      });
-  }
-  return refreshPromise;
+      }
+    })
+    .finally(() => {
+      refreshPromise = null;
+    });
 }
 
-export const frameAncestorsMiddleware: RequestHandler = (req, res, next) => {
-  getPartnerOrigins()
-    .then((partnerOrigins) => {
-      const sources = ["'self'", ...partnerOrigins];
-      res.setHeader('Content-Security-Policy', `frame-ancestors ${sources.join(' ')}`);
-      next();
-    })
-    .catch(() => {
-      // getPartnerOrigins already degrades internally and should not reject,
-      // but fail closed to 'self' only rather than skip the header entirely.
-      res.setHeader('Content-Security-Policy', "frame-ancestors 'self'");
-      next();
-    });
+function getCachedPartnerOrigins(): string[] {
+  const now = Date.now();
+  if (!cache || now - cache.fetchedAt >= PARTNER_ORIGINS_CACHE_MS) {
+    refreshPartnerOriginsInBackground();
+  }
+  // Serve whatever is cached right now (possibly stale, possibly empty on
+  // the very first request) rather than waiting on the refresh above.
+  return cache?.partnerOrigins ?? [];
+}
+
+export const frameAncestorsMiddleware: RequestHandler = (_req, res, next) => {
+  const sources = ["'self'", ...getCachedPartnerOrigins()];
+  res.setHeader('Content-Security-Policy', `frame-ancestors ${sources.join(' ')}`);
+  next();
 };

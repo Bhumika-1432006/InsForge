@@ -26,7 +26,10 @@ import { advisorRouter } from '@/api/routes/advisor/index.routes.js';
 import { errorMiddleware } from '@/api/middlewares/error.js';
 import { corsMiddleware } from '@/api/middlewares/cors.js';
 import { helmetMiddleware } from '@/api/middlewares/helmet.js';
-import { frameAncestorsMiddleware } from '@/api/middlewares/frame-ancestors.js';
+import {
+  frameAncestorsMiddleware,
+  warmPartnerOriginsCache,
+} from '@/api/middlewares/frame-ancestors.js';
 import { destroyEmailCooldownInterval } from '@/api/middlewares/rate-limiters.js';
 import { isCloudEnvironment } from '@/utils/environment.js';
 import { RealtimeManager } from '@/infra/realtime/realtime.manager.js';
@@ -86,6 +89,12 @@ export async function createApp() {
 
   // Initialize SQL parser WASM module
   await initSqlParser();
+
+  // Warm the frame-ancestors partner-origin cache before accepting
+  // connections, so the first real request (which may be the partner's own
+  // dashboard-embedding iframe load) doesn't race the background refresh
+  // and get stuck with a 'self'-only policy it can never recover from.
+  await warmPartnerOriginsCache();
 
   const app = express();
 

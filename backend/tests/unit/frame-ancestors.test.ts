@@ -10,23 +10,31 @@ import type { RequestHandler } from 'express';
  * the dashboard. This middleware restores real protection via a scoped
  * `frame-ancestors` CSP directive instead.
  *
- * Also a regression test for a follow-up finding: the middleware is mounted
- * globally ahead of every route (including health checks), so it must never
- * block a request on the outbound fetch to config.insforge.dev — it serves
- * from cache synchronously and refreshes in the background.
+ * Also covers two follow-up review findings:
+ *   - the middleware is mounted globally ahead of every route (including
+ *     health checks), so it must never block a request on the outbound
+ *     fetch to config.insforge.dev — it serves from cache synchronously and
+ *     refreshes in the background.
+ *   - a cold process's first request (which may be the partner's own
+ *     iframe load) must not race that background fetch and get stuck with
+ *     a 'self'-only policy — `warmPartnerOriginsCache()` is awaited before
+ *     the app accepts connections (server.ts) to prevent that.
  *
  * The middleware caches the fetched partner-origin list at module scope, so
  * each test resets the module registry and re-imports it fresh — otherwise
  * the first test's cached result would leak into later tests within the
  * TTL window.
  */
-async function buildApp() {
+async function loadModule() {
   vi.resetModules();
-  const { frameAncestorsMiddleware } =
-    (await import('../../src/api/middlewares/frame-ancestors.js')) as {
-      frameAncestorsMiddleware: RequestHandler;
-    };
+  return (await import('../../src/api/middlewares/frame-ancestors.js')) as {
+    frameAncestorsMiddleware: RequestHandler;
+    warmPartnerOriginsCache: () => Promise<void>;
+  };
+}
 
+async function buildApp() {
+  const { frameAncestorsMiddleware } = await loadModule();
   const app = express();
   app.use(frameAncestorsMiddleware);
   app.get('/ping', (_req, res) => res.json({ ok: true }));
@@ -34,6 +42,11 @@ async function buildApp() {
 }
 
 describe('frame-ancestors middleware', () => {
+  // Each test calls vi.resetModules() and dynamically re-imports the module
+  // under test, which re-transpiles it every time; the default 10s per-test
+  // timeout can be tight under that overhead, so give these a bit more room.
+  vi.setConfig({ testTimeout: 20_000 });
+
   const originalFetch = global.fetch;
 
   beforeEach(() => {
@@ -89,7 +102,7 @@ describe('frame-ancestors middleware', () => {
     );
   });
 
-  it('degrades to self only, without throwing, when the background fetch fails and nothing was cached yet', async () => {
+  it('degrades to self only, without throwing, when the fetch rejects and nothing was cached yet', async () => {
     global.fetch = vi.fn().mockRejectedValue(new Error('network error')) as unknown as typeof fetch;
 
     const app = await buildApp();
@@ -99,6 +112,51 @@ describe('frame-ancestors middleware', () => {
 
     expect(firstRes.headers['content-security-policy']).toBe("frame-ancestors 'self'");
     expect(secondRes.headers['content-security-policy']).toBe("frame-ancestors 'self'");
+  });
+
+  it('degrades to self only when the config endpoint responds with a non-ok HTTP status', async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+    }) as unknown as typeof fetch;
+
+    const app = await buildApp();
+    await request(app).get('/ping');
+    await new Promise((resolve) => setImmediate(resolve));
+    const res = await request(app).get('/ping');
+
+    expect(res.headers['content-security-policy']).toBe("frame-ancestors 'self'");
+  });
+
+  it('keeps serving the last known-good partner list when a later refresh fails', async () => {
+    const fetchMock = vi.fn();
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ partner_sites: ['https://partner.example.com'] }),
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const { frameAncestorsMiddleware, warmPartnerOriginsCache } = await loadModule();
+    await warmPartnerOriginsCache();
+    const app = express();
+    app.use(frameAncestorsMiddleware);
+    app.get('/ping', (_req, res) => res.json({ ok: true }));
+
+    const goodRes = await request(app).get('/ping');
+    expect(goodRes.headers['content-security-policy']).toBe(
+      "frame-ancestors 'self' https://partner.example.com"
+    );
+
+    // A later refresh (simulated directly, since the TTL is 30s and this
+    // test doesn't fast-forward real time) fails — the cache should keep
+    // serving the last known-good list rather than dropping it.
+    fetchMock.mockRejectedValueOnce(new Error('network error'));
+    await warmPartnerOriginsCache();
+
+    const staleRes = await request(app).get('/ping');
+    expect(staleRes.headers['content-security-policy']).toBe(
+      "frame-ancestors 'self' https://partner.example.com"
+    );
   });
 
   it('does not re-fetch within the TTL window', async () => {
@@ -115,5 +173,40 @@ describe('frame-ancestors middleware', () => {
     await request(app).get('/ping');
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('caches an empty result on failure too, so a sustained outage does not re-fetch on every request', async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new Error('network error'));
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const app = await buildApp();
+    await request(app).get('/ping');
+    await new Promise((resolve) => setImmediate(resolve));
+    await request(app).get('/ping');
+    await request(app).get('/ping');
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('warmPartnerOriginsCache populates the cache before any request arrives', async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ partner_sites: ['https://partner.example.com'] }),
+    }) as unknown as typeof fetch;
+
+    const { frameAncestorsMiddleware, warmPartnerOriginsCache } = await loadModule();
+    await warmPartnerOriginsCache();
+
+    const app = express();
+    app.use(frameAncestorsMiddleware);
+    app.get('/ping', (_req, res) => res.json({ ok: true }));
+
+    // No 'setImmediate' wait needed: the cache is already warm from the
+    // awaited warmPartnerOriginsCache() call above, so even the very first
+    // request sees the partner origin.
+    const res = await request(app).get('/ping');
+    expect(res.headers['content-security-policy']).toBe(
+      "frame-ancestors 'self' https://partner.example.com"
+    );
   });
 });

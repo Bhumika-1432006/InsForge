@@ -16,8 +16,12 @@ import logger from '@/utils/logger.js';
  * This middleware is mounted globally, ahead of every route including health
  * checks and webhooks, so it must never make a request wait on the outbound
  * fetch to config.insforge.dev: it always applies the header synchronously
- * from whatever is already cached (or 'self' only, before the first fetch
- * ever completes) and refreshes the cache in the background.
+ * from whatever is already cached and refreshes the cache in the background.
+ * `warmPartnerOriginsCache()` is awaited once at server startup (see
+ * server.ts) so the cache is already populated before the first real
+ * request arrives — including the partner's own dashboard-embedding
+ * request — instead of that first request racing the background fetch and
+ * getting a 'self'-only policy it can never recover from.
  */
 
 const PARTNERSHIP_CONFIG_URL = 'https://config.insforge.dev/partnership.json';
@@ -54,12 +58,13 @@ async function fetchPartnerOrigins(): Promise<string[]> {
   }
 }
 
-// Kicks off a refresh without making any caller wait on it. Concurrent
-// requests that all see a stale/missing cache in the same tick coalesce into
-// a single outbound fetch instead of each starting their own.
-function refreshPartnerOriginsInBackground(): void {
+// Kicks off a refresh and returns the promise so callers that want to await
+// it (server startup) can, while callers on the request path can fire it and
+// move on without waiting. Concurrent callers that all see a stale/missing
+// cache in the same tick coalesce into a single outbound fetch.
+function refreshPartnerOrigins(): Promise<void> {
   if (refreshPromise) {
-    return;
+    return refreshPromise;
   }
   refreshPromise = fetchPartnerOrigins()
     .then((partnerOrigins) => {
@@ -79,21 +84,40 @@ function refreshPartnerOriginsInBackground(): void {
           'Failed to fetch partner origins for frame-ancestors; defaulting to self only',
           { error }
         );
+        // Cache the empty result too (also re-armed on the same TTL) —
+        // otherwise every request during an outage would see `cache` still
+        // null and kick off yet another fetch of its own once this one
+        // settles.
+        cache = { partnerOrigins: [], fetchedAt: Date.now() };
       }
     })
     .finally(() => {
       refreshPromise = null;
     });
+  return refreshPromise;
 }
 
 function getCachedPartnerOrigins(): string[] {
   const now = Date.now();
   if (!cache || now - cache.fetchedAt >= PARTNER_ORIGINS_CACHE_MS) {
-    refreshPartnerOriginsInBackground();
+    // Fire-and-forget: the request path must not wait on this.
+    void refreshPartnerOrigins();
   }
-  // Serve whatever is cached right now (possibly stale, possibly empty on
-  // the very first request) rather than waiting on the refresh above.
+  // Serve whatever is cached right now (possibly stale) rather than waiting
+  // on the refresh above.
   return cache?.partnerOrigins ?? [];
+}
+
+/**
+ * Awaited once during server startup (before the app starts accepting
+ * connections) so the very first request — which may itself be the
+ * partner's iframe load — already sees a warm cache instead of racing a
+ * background fetch it has no way to recover from. Failure here is not
+ * fatal: it just means the server starts with the same 'self'-only fallback
+ * the request-path refresh would have produced anyway.
+ */
+export async function warmPartnerOriginsCache(): Promise<void> {
+  await refreshPartnerOrigins();
 }
 
 export const frameAncestorsMiddleware: RequestHandler = (_req, res, next) => {

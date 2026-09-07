@@ -27,6 +27,10 @@ export const helmetMiddleware: RequestHandler = helmet({
   // from rendering at all in the cloud-hosting partner's cross-origin parent
   // iframe — useCloudHosting.ts documents that PROJECT_INFO only ever
   // arrives from a parent iframe, i.e. that embed is a supported, expected
-  // flow, not something to guard against.
+  // flow, not something to guard against. X-Frame-Options has no origin-list
+  // form, so it can't express "this partner, not everyone" — real framing
+  // protection comes from the scoped `frame-ancestors` CSP directive set by
+  // frameAncestorsMiddleware (mounted alongside this in server.ts), which
+  // modern browsers honor in preference to X-Frame-Options anyway.
   frameguard: false,
 });

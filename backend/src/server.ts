@@ -26,6 +26,7 @@ import { advisorRouter } from '@/api/routes/advisor/index.routes.js';
 import { errorMiddleware } from '@/api/middlewares/error.js';
 import { corsMiddleware } from '@/api/middlewares/cors.js';
 import { helmetMiddleware } from '@/api/middlewares/helmet.js';
+import { frameAncestorsMiddleware } from '@/api/middlewares/frame-ancestors.js';
 import { destroyEmailCooldownInterval } from '@/api/middlewares/rate-limiters.js';
 import { isCloudEnvironment } from '@/utils/environment.js';
 import { RealtimeManager } from '@/infra/realtime/realtime.manager.js';
@@ -93,6 +94,7 @@ export async function createApp() {
 
   // Basic middleware
   app.use(helmetMiddleware);
+  app.use(frameAncestorsMiddleware);
   app.use(corsMiddleware);
   app.use(cookieParser()); // Parse cookies for refresh token handling
   app.use((req: Request, res: Response, next: NextFunction) => {
